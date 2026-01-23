@@ -5,16 +5,20 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/lynix/krill/storage"
 	"github.com/lynix/krill/storage/gorilla"
 )
 
 // BadgerTSDB is a persistent time-series database using BadgerDB
 type BadgerTSDB struct {
-	db  *badger.DB
-	ttl time.Duration
+	db     *badger.DB
+	ttl    time.Duration
+	labels map[uint64]storage.Labels // seriesID -> labels mapping
 }
 
 // BadgerOptions contains configuration for BadgerTSDB
@@ -39,17 +43,23 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 	}
 
 	return &BadgerTSDB{
-		db:  db,
-		ttl: opts.TTL,
+		db:     db,
+		ttl:    opts.TTL,
+		labels: make(map[uint64]storage.Labels),
 	}, nil
 }
 
-// TsdbPut stores a time-series data point with Gorilla compression
-func (bdb *BadgerTSDB) TsdbPut(ts int64, metric string, value float64) error {
-	// Create time-partitioned key: metric:timestamp_bucket
+// PutLabels stores a time-series data point with Gorilla compression using Labels
+func (bdb *BadgerTSDB) PutLabels(ts int64, labels storage.Labels, value float64) error {
+	seriesID := labels.Hash()
+	
+	// Store labels mapping
+	bdb.labels[seriesID] = labels.Copy()
+	
+	// Create time-partitioned key: seriesID:timestamp_bucket
 	// Use hourly buckets for better read performance
 	bucket := ts / 3600 * 3600
-	key := makeKey(metric, bucket)
+	key := makeKeyFromID(seriesID, bucket)
 
 	return bdb.db.Update(func(txn *badger.Txn) error {
 		// Get existing series for this bucket
@@ -96,7 +106,7 @@ func (bdb *BadgerTSDB) TsdbPut(ts int64, metric string, value float64) error {
 
 		// Create new series block with all data
 		series := &SeriesBlock{
-			Metric:           metric,
+			SeriesID:         seriesID,
 			StartTimestamp:   bucket,
 			timestampEncoder: gorilla.NewTimestampEncoder(),
 			valueEncoder:     gorilla.NewValueEncoder(),
@@ -125,11 +135,19 @@ func (bdb *BadgerTSDB) TsdbPut(ts int64, metric string, value float64) error {
 	})
 }
 
-// Get retrieves all data points for a metric within a time range
-func (bdb *BadgerTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float64, error) {
+// TsdbPut stores a time-series data point with Gorilla compression (legacy string-based API)
+func (bdb *BadgerTSDB) TsdbPut(ts int64, metric string, value float64) error {
+	labels := parseMetricString(metric)
+	return bdb.PutLabels(ts, labels, value)
+}
+
+// GetLabels retrieves all data points for a series within a time range using Labels
+func (bdb *BadgerTSDB) GetLabels(labels storage.Labels, startTs, endTs int64) ([]int64, []float64, error) {
 	if endTs == 0 {
 		endTs = math.MaxInt64
 	}
+
+	seriesID := labels.Hash()
 
 	type dataPoint struct {
 		timestamp int64
@@ -139,7 +157,7 @@ func (bdb *BadgerTSDB) Get(metric string, startTs, endTs int64) ([]int64, []floa
 
 	err := bdb.db.View(func(txn *badger.Txn) error {
 		// Iterate through all buckets that might contain data
-		prefix := []byte(metric + ":")
+		prefix := makeKeyPrefixFromID(seriesID)
 		opts := badger.DefaultIteratorOptions
 		opts.Prefix = prefix
 
@@ -186,7 +204,7 @@ func (bdb *BadgerTSDB) Get(metric string, startTs, endTs int64) ([]int64, []floa
 	}
 
 	if len(allPoints) == 0 {
-		return nil, nil, fmt.Errorf("metric not found: %s", metric)
+		return nil, nil, fmt.Errorf("metric not found: %s", labels.String())
 	}
 
 	// Sort by timestamp (BadgerDB iterator may not return keys in order)
@@ -210,31 +228,28 @@ func (bdb *BadgerTSDB) Get(metric string, startTs, endTs int64) ([]int64, []floa
 	return timestamps, values, nil
 }
 
-// GetMetrics returns all metric names
+// Get retrieves all data points for a metric within a time range (legacy string-based API)
+func (bdb *BadgerTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float64, error) {
+	labels := parseMetricString(metric)
+	return bdb.GetLabels(labels, startTs, endTs)
+}
+
+// GetAllSeries returns all series (seriesID -> labels) in the database
+func (bdb *BadgerTSDB) GetAllSeries() map[uint64]storage.Labels {
+	result := make(map[uint64]storage.Labels)
+	for id, labels := range bdb.labels {
+		result[id] = labels.Copy()
+	}
+	return result
+}
+
+// GetMetrics returns all metric names (legacy API, returns formatted strings)
 func (bdb *BadgerTSDB) GetMetrics() ([]string, error) {
 	metrics := make(map[string]bool)
 
-	err := bdb.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		for it.Rewind(); it.Valid(); it.Next() {
-			item := it.Item()
-			key := item.Key()
-
-			// Extract metric name from key (format: metric:bucket)
-			metric := extractMetricFromKey(key)
-			metrics[metric] = true
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
+	for _, labels := range bdb.labels {
+		metricStr := formatLabelsAsMetricString(labels)
+		metrics[metricStr] = true
 	}
 
 	result := make([]string, 0, len(metrics))
@@ -257,7 +272,7 @@ func (bdb *BadgerTSDB) RunGC() error {
 
 // SeriesBlock represents a compressed time series block
 type SeriesBlock struct {
-	Metric           string
+	SeriesID         uint64 // Changed from Metric string
 	StartTimestamp   int64
 	Count            int
 	FirstTimestamp   int64
@@ -433,6 +448,17 @@ func (sb *SeriesBlock) Decode() ([]int64, []float64, error) {
 }
 
 // Helper functions
+func makeKeyFromID(seriesID uint64, bucket int64) []byte {
+	key := fmt.Sprintf("%d:%d", seriesID, bucket)
+	return []byte(key)
+}
+
+func makeKeyPrefixFromID(seriesID uint64) []byte {
+	prefix := fmt.Sprintf("%d:", seriesID)
+	return []byte(prefix)
+}
+
+// Legacy helper (no longer used internally)
 func makeKey(metric string, bucket int64) []byte {
 	key := fmt.Sprintf("%s:%d", metric, bucket)
 	return []byte(key)
@@ -446,4 +472,93 @@ func extractMetricFromKey(key []byte) string {
 		}
 	}
 	return keyStr
+}
+
+// parseMetricString parses a metric string (e.g., "http_requests{method=\"GET\",status=\"200\"}")
+// into Labels
+func parseMetricString(metric string) storage.Labels {
+	// Find the opening brace
+	braceIdx := strings.Index(metric, "{")
+	
+	var name string
+	var labels storage.Labels
+	
+	if braceIdx == -1 {
+		// No tags, just metric name
+		name = metric
+	} else {
+		// Extract metric name
+		name = metric[:braceIdx]
+		
+		// Extract tags
+		tagsStr := metric[braceIdx+1:]
+		if len(tagsStr) > 0 && tagsStr[len(tagsStr)-1] == '}' {
+			tagsStr = tagsStr[:len(tagsStr)-1]
+		}
+		
+		// Parse tags
+		tags := splitTags(tagsStr)
+		labels = make(storage.Labels, 0, len(tags)+1)
+		for key, value := range tags {
+			labels = append(labels, storage.Label{Name: key, Value: value})
+		}
+	}
+	
+	// Always add __name__ label
+	labels = append(labels, storage.Label{Name: "__name__", Value: name})
+	sort.Sort(labels)
+	
+	return labels
+}
+
+// splitTags splits a tag string (e.g., "method=\"GET\",status=\"200\"") into a map
+func splitTags(tagsStr string) map[string]string {
+	tags := make(map[string]string)
+	if tagsStr == "" {
+		return tags
+	}
+	
+	// Simple parser for key="value" pairs
+	parts := strings.Split(tagsStr, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		eqIdx := strings.Index(part, "=")
+		if eqIdx == -1 {
+			continue
+		}
+		
+		key := strings.TrimSpace(part[:eqIdx])
+		value := strings.TrimSpace(part[eqIdx+1:])
+		
+		// Remove quotes from value
+		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+			value = value[1 : len(value)-1]
+		}
+		
+		tags[key] = value
+	}
+	
+	return tags
+}
+
+// formatLabelsAsMetricString converts Labels back to metric string format
+func formatLabelsAsMetricString(labels storage.Labels) string {
+	name := labels.Get("__name__")
+	if name == "" {
+		name = "unknown"
+	}
+	
+	// Collect non-name labels
+	var tagParts []string
+	for _, label := range labels {
+		if label.Name != "__name__" {
+			tagParts = append(tagParts, fmt.Sprintf("%s=\"%s\"", label.Name, label.Value))
+		}
+	}
+	
+	if len(tagParts) == 0 {
+		return name
+	}
+	
+	return fmt.Sprintf("%s{%s}", name, strings.Join(tagParts, ","))
 }

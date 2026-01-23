@@ -4,19 +4,21 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/lynix/krill/storage"
 	"github.com/lynix/krill/storage/gorilla"
 )
 
 // MemoryStorage implements in-memory storage using Gorilla compression
 type MemoryStorage struct {
 	mu      sync.RWMutex
-	metrics map[string]*MetricSeries
+	series  map[uint64]*MetricSeries  // seriesID -> series
+	labels  map[uint64]storage.Labels // seriesID -> labels
 }
 
 // MetricSeries stores compressed time-series data for a single metric
 type MetricSeries struct {
 	mu              sync.Mutex
-	name            string
+	id              uint64
 	firstTimestamp  int64
 	lastTimestamp   int64
 	firstValue      float64
@@ -29,21 +31,34 @@ type MetricSeries struct {
 // NewMemoryStorage creates a new in-memory storage
 func NewMemoryStorage() *MemoryStorage {
 	return &MemoryStorage{
-		metrics: make(map[string]*MetricSeries),
+		series: make(map[uint64]*MetricSeries),
+		labels: make(map[uint64]storage.Labels),
 	}
 }
 
 // Put stores a time-series data point with Gorilla compression
+// This is a legacy wrapper that converts string metric to Labels
 func (ms *MemoryStorage) Put(ts int64, metric string, value float64) error {
+	// Parse metric string to extract name and tags
+	name, tags := parseMetricString(metric)
+	labels := storage.LabelsFromMap(name, tags)
+	return ms.PutLabels(ts, labels, value)
+}
+
+// PutLabels stores a time-series data point using Labels
+func (ms *MemoryStorage) PutLabels(ts int64, labels storage.Labels, value float64) error {
+	seriesID := labels.Hash()
+	
 	ms.mu.Lock()
-	series, exists := ms.metrics[metric]
+	series, exists := ms.series[seriesID]
 	if !exists {
 		series = &MetricSeries{
-			name:            metric,
+			id:              seriesID,
 			timestampStream: gorilla.NewTimestampEncoder(),
 			valueStream:     gorilla.NewValueEncoder(),
 		}
-		ms.metrics[metric] = series
+		ms.series[seriesID] = series
+		ms.labels[seriesID] = labels.Copy()
 	}
 	ms.mu.Unlock()
 
@@ -86,13 +101,23 @@ func (ms *MemoryStorage) Put(ts int64, metric string, value float64) error {
 }
 
 // Get retrieves all data points for a metric within a time range
+// This is a legacy wrapper
 func (ms *MemoryStorage) Get(metric string, startTs, endTs int64) ([]int64, []float64, error) {
+	name, tags := parseMetricString(metric)
+	labels := storage.LabelsFromMap(name, tags)
+	return ms.GetLabels(labels, startTs, endTs)
+}
+
+// GetLabels retrieves all data points for labels within a time range
+func (ms *MemoryStorage) GetLabels(labels storage.Labels, startTs, endTs int64) ([]int64, []float64, error) {
+	seriesID := labels.Hash()
+	
 	ms.mu.RLock()
-	series, exists := ms.metrics[metric]
+	series, exists := ms.series[seriesID]
 	ms.mu.RUnlock()
 
 	if !exists {
-		return nil, nil, fmt.Errorf("metric not found: %s", metric)
+		return nil, nil, fmt.Errorf("series not found")
 	}
 
 	series.mu.Lock()
@@ -158,16 +183,29 @@ func (ms *MemoryStorage) Get(metric string, startTs, endTs int64) ([]int64, []fl
 	return timestamps, values, nil
 }
 
-// GetMetrics returns all metric names
+// GetMetrics returns all metric names (as formatted strings for backward compatibility)
 func (ms *MemoryStorage) GetMetrics() ([]string, error) {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
 
-	metrics := make([]string, 0, len(ms.metrics))
-	for metric := range ms.metrics {
-		metrics = append(metrics, metric)
+	metrics := make([]string, 0, len(ms.series))
+	for seriesID := range ms.series {
+		labels := ms.labels[seriesID]
+		metrics = append(metrics, formatLabelsAsMetricString(labels))
 	}
 	return metrics, nil
+}
+
+// GetAllSeries returns all series with their labels
+func (ms *MemoryStorage) GetAllSeries() map[uint64]storage.Labels {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+
+	result := make(map[uint64]storage.Labels, len(ms.labels))
+	for id, labels := range ms.labels {
+		result[id] = labels.Copy()
+	}
+	return result
 }
 
 // Close closes the storage (no-op for memory storage)
@@ -180,28 +218,154 @@ func (ms *MemoryStorage) DeleteOlderThan(cutoffTs int64) error {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
-	toDelete := make([]string, 0)
+	toDelete := make([]uint64, 0)
 	
-	for metric, series := range ms.metrics {
+	for seriesID, series := range ms.series {
 		series.mu.Lock()
 		if series.lastTimestamp < cutoffTs {
 			// Entire series is old, delete it
-			toDelete = append(toDelete, metric)
+			toDelete = append(toDelete, seriesID)
 		}
 		series.mu.Unlock()
 	}
 
-	for _, metric := range toDelete {
-		delete(ms.metrics, metric)
+	for _, seriesID := range toDelete {
+		delete(ms.series, seriesID)
+		delete(ms.labels, seriesID)
 	}
 
 	return nil
 }
 
-// GetSeries returns the metric series for testing purposes
+// parseMetricString parses a metric string like "name{tag1=\"v1\",tag2=\"v2\"}"
+// Returns metric name and tags map
+func parseMetricString(metric string) (string, map[string]string) {
+	tags := make(map[string]string)
+	
+	// Find { position
+	bracePos := -1
+	for i, c := range metric {
+		if c == '{' {
+			bracePos = i
+			break
+		}
+	}
+	
+	if bracePos < 0 {
+		return metric, tags
+	}
+	
+	name := metric[:bracePos]
+	
+	// Find } position
+	endPos := len(metric)
+	for i := bracePos; i < len(metric); i++ {
+		if metric[i] == '}' {
+			endPos = i
+			break
+		}
+	}
+	
+	// Parse tags
+	tagStr := metric[bracePos+1 : endPos]
+	if tagStr == "" {
+		return name, tags
+	}
+	
+	// Simple parser
+	pairs := splitTags(tagStr)
+	for _, pair := range pairs {
+		kv := splitKeyValue(pair)
+		if len(kv) == 2 {
+			key := trim(kv[0])
+			value := trimQuotes(trim(kv[1]))
+			tags[key] = value
+		}
+	}
+	
+	return name, tags
+}
+
+// formatLabelsAsMetricString formats labels as "name{tag1=\"v1\",tag2=\"v2\"}"
+func formatLabelsAsMetricString(labels storage.Labels) string {
+	name := labels.Get("__name__")
+	if name == "" {
+		name = "unknown"
+	}
+	
+	tags := labels.WithoutName()
+	if len(tags) == 0 {
+		return name
+	}
+	
+	return name + tags.String()
+}
+
+func splitTags(s string) []string {
+	result := make([]string, 0)
+	current := ""
+	inQuote := false
+	
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' {
+			inQuote = !inQuote
+			current += string(c)
+		} else if c == ',' && !inQuote {
+			if current != "" {
+				result = append(result, current)
+				current = ""
+			}
+		} else {
+			current += string(c)
+		}
+	}
+	
+	if current != "" {
+		result = append(result, current)
+	}
+	
+	return result
+}
+
+func splitKeyValue(s string) []string {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '=' {
+			return []string{s[:i], s[i+1:]}
+		}
+	}
+	return []string{s}
+}
+
+func trim(s string) string {
+	start := 0
+	end := len(s)
+	
+	for start < end && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	
+	return s[start:end]
+}
+
+func trimQuotes(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// GetSeries returns the metric series for testing purposes (legacy)
 func (ms *MemoryStorage) GetSeries(metric string) *PublicMetricSeries {
+	name, tags := parseMetricString(metric)
+	labels := storage.LabelsFromMap(name, tags)
+	seriesID := labels.Hash()
+	
 	ms.mu.RLock()
-	series, exists := ms.metrics[metric]
+	series, exists := ms.series[seriesID]
 	ms.mu.RUnlock()
 	
 	if !exists {
@@ -212,7 +376,7 @@ func (ms *MemoryStorage) GetSeries(metric string) *PublicMetricSeries {
 	defer series.mu.Unlock()
 	
 	return &PublicMetricSeries{
-		Name:            series.name,
+		Name:            formatLabelsAsMetricString(labels),
 		FirstTimestamp:  series.firstTimestamp,
 		LastTimestamp:   series.lastTimestamp,
 		FirstValue:      series.firstValue,

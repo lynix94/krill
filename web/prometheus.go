@@ -217,10 +217,11 @@ func (ph *PrometheusHandler) HandleWrite(w http.ResponseWriter, r *http.Request)
 		req.Time = time.Now().Unix()
 	}
 
-	// Build metric key with tags
+	// Convert to Labels format internally
+	// Build metric key with tags for backward compatibility
 	metricKey := buildMetricKey(req.Metric, req.Tags)
 
-	// Write to TSDB
+	// Write to TSDB (TSDB will convert to Labels internally)
 	if err := ph.tsdb.TsdbPut(req.Time, metricKey, req.Value); err != nil {
 		ph.sendError(w, http.StatusInternalServerError, err.Error())
 		return

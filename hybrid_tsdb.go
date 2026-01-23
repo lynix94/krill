@@ -2,6 +2,7 @@ package krill
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,7 +107,7 @@ func (h *HybridTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float6
 
 	// Query needs data from persistent storage
 	persistTimestamps, persistValues, err := h.persistStorage.Get(metric, startTs, cacheCutoff-1)
-	if err != nil && err.Error() != fmt.Sprintf("metric not found: %s", metric) {
+	if err != nil && !strings.Contains(err.Error(), "metric not found") {
 		return nil, nil, fmt.Errorf("failed to query persistent storage: %w", err)
 	}
 
@@ -117,7 +118,7 @@ func (h *HybridTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float6
 
 	// Get recent data from memory cache
 	cacheTimestamps, cacheValues, err := h.memoryCache.Get(metric, cacheCutoff, endTs)
-	if err != nil && err.Error() != fmt.Sprintf("metric not found: %s", metric) {
+	if err != nil && !strings.Contains(err.Error(), "metric not found") {
 		// If not in cache either, return error
 		if len(allTimestamps) == 0 {
 			return nil, nil, fmt.Errorf("metric not found: %s", metric)
