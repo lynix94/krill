@@ -67,8 +67,8 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Parse query to extract metric name and label matchers
-	metricName, labelMatchers := parseQuery(query)
+	// Parse query with aggregation support
+	parsed := parsePromQL(query)
 
 	// Get all metrics and filter by label matchers
 	metrics, err := ph.tsdb.GetMetrics()
@@ -77,29 +77,57 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Determine query time range
+	var startTs, endTs int64
+	if parsed.RangeVector > 0 {
+		// Range vector function: get data from [queryTime - range] to queryTime
+		endTs = queryTime
+		startTs = queryTime - parsed.RangeVector
+	} else {
+		// Normal instant query: just get latest value
+		startTs = 0
+		endTs = queryTime
+	}
+
 	// Filter metrics by name and labels
 	var result []QueryResult
 	for _, metric := range metrics {
-		if matchesQuery(metric, metricName, labelMatchers) {
+		if matchesQuery(metric, parsed.MetricName, parsed.LabelMatchers) {
 			// Query TSDB for this specific metric
-			timestamps, values, err := ph.tsdb.Get(metric, 0, queryTime)
+			timestamps, values, err := ph.tsdb.Get(metric, startTs, endTs)
 			if err != nil {
 				continue
 			}
 
-			// Get the latest value
 			if len(values) > 0 {
-				lastIdx := len(values) - 1
 				// Parse metric name and tags from stored key
 				parsedName, parsedTags := parseMetricKey(metric)
 				parsedTags["__name__"] = parsedName
-				result = append(result, QueryResult{
-					Metric: parsedTags,
-					Value:  []interface{}{timestamps[lastIdx], fmt.Sprintf("%f", values[lastIdx])},
-				})
+
+				if parsed.RangeVector > 0 {
+					// Range vector: return all values in range
+					valuesArray := make([][]interface{}, len(values))
+					for i := range values {
+						valuesArray[i] = []interface{}{timestamps[i], fmt.Sprintf("%f", values[i])}
+					}
+					result = append(result, QueryResult{
+						Metric: parsedTags,
+						Values: valuesArray,
+					})
+				} else {
+					// Instant query: return only latest value
+					lastIdx := len(values) - 1
+					result = append(result, QueryResult{
+						Metric: parsedTags,
+						Value:  []interface{}{timestamps[lastIdx], fmt.Sprintf("%f", values[lastIdx])},
+					})
+				}
 			}
 		}
 	}
+
+	// Apply aggregation if specified
+	result = applyAggregation(parsed, result)
 
 	ph.sendSuccess(w, QueryData{
 		ResultType: "vector",
@@ -145,8 +173,8 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 		end = time.Now().Unix()
 	}
 
-	// Parse query to extract metric name and label matchers
-	metricName, labelMatchers := parseQuery(query)
+	// Parse query with aggregation support
+	parsed := parsePromQL(query)
 
 	// Get all metrics and filter by label matchers
 	metrics, err := ph.tsdb.GetMetrics()
@@ -158,7 +186,7 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	// Filter metrics by name and labels
 	var result []QueryResult
 	for _, metric := range metrics {
-		if matchesQuery(metric, metricName, labelMatchers) {
+		if matchesQuery(metric, parsed.MetricName, parsed.LabelMatchers) {
 			// Query TSDB for this specific metric
 			timestamps, values, err := ph.tsdb.Get(metric, start, end)
 			if err != nil {
@@ -180,6 +208,9 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 			}
 		}
 	}
+
+	// Apply aggregation if specified
+	result = applyAggregation(parsed, result)
 
 	ph.sendSuccess(w, QueryData{
 		ResultType: "matrix",

@@ -88,7 +88,8 @@ type QueryRangeResponse struct {
 		ResultType string `json:"resultType"`
 		Result     []struct {
 			Metric map[string]string `json:"metric"`
-			Values [][]interface{}   `json:"values"` // [[timestamp, value], ...]
+			Values [][]interface{}   `json:"values,omitempty"` // For range queries: [[timestamp, value], ...]
+			Value  []interface{}     `json:"value,omitempty"`  // For instant queries: [timestamp, value]
 		} `json:"result"`
 	} `json:"data"`
 }
@@ -266,19 +267,177 @@ func parseCommandLine(line string) []string {
 	return args
 }
 
-func handleQueryRange(args []string) error {
-	if len(args) < 3 {
-		return fmt.Errorf("query_range requires: <metric> <start_ts> <end_ts>")
+func handleInstantQuery(metric string) error {
+	// Build GET request URL for instant query
+	queryURL := fmt.Sprintf("%s/api/v1/query?query=%s",
+		serverURL, url.QueryEscape(metric))
+
+	resp, err := http.Get(queryURL)
+	if err != nil {
+		return fmt.Errorf("failed to query server: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned error (status %d): %s", resp.StatusCode, string(body))
 	}
 
-	metric := args[0]
-	startTs, err := parseTimestamp(args[1])
-	if err != nil {
-		return fmt.Errorf("invalid start timestamp: %w", err)
+	var result QueryRangeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
 	}
-	endTs, err := parseTimestamp(args[2])
+
+	if result.Status != "success" {
+		return fmt.Errorf("server returned error status")
+	}
+
+	if len(result.Data.Result) == 0 {
+		fmt.Println("No data found")
+		return nil
+	}
+
+	// Print results
+	fmt.Printf("Found %d series\n", len(result.Data.Result))
+	fmt.Println(strings.Repeat("=", 80))
+	
+	for idx, series := range result.Data.Result {
+		fmt.Printf("\n[Series %d/%d]\n", idx+1, len(result.Data.Result))
+		fmt.Printf("Metric: ")
+		first := true
+		for k, v := range series.Metric {
+			if !first {
+				fmt.Printf(", ")
+			}
+			fmt.Printf("%s=%s", k, v)
+			first = false
+		}
+		fmt.Println()
+		
+		if len(series.Value) >= 2 {
+			ts := int64(series.Value[0].(float64))
+			val := series.Value[1].(string)
+			fmt.Printf("Value: %s (at %s)\n", val, time.Unix(ts, 0).Format("2006-01-02 15:04:05"))
+		}
+	}
+	fmt.Println()
+	
+	return nil
+}
+
+func handleInstantQueryWithTime(metric string, queryTime int64) error {
+	// Build GET request URL for instant query with specific time
+	queryURL := fmt.Sprintf("%s/api/v1/query?query=%s&time=%d",
+		serverURL, url.QueryEscape(metric), queryTime)
+
+	resp, err := http.Get(queryURL)
 	if err != nil {
-		return fmt.Errorf("invalid end timestamp: %w", err)
+		return fmt.Errorf("failed to query server: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var result QueryRangeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if result.Status != "success" {
+		return fmt.Errorf("server returned error status")
+	}
+
+	if len(result.Data.Result) == 0 {
+		fmt.Println("No data found")
+		return nil
+	}
+
+	// Print results (same as instant query)
+	fmt.Printf("Found %d series\n", len(result.Data.Result))
+	fmt.Println(strings.Repeat("=", 80))
+	
+	for idx, series := range result.Data.Result {
+		fmt.Printf("\n[Series %d/%d]\n", idx+1, len(result.Data.Result))
+		fmt.Printf("Metric: ")
+		first := true
+		for k, v := range series.Metric {
+			if !first {
+				fmt.Printf(", ")
+			}
+			fmt.Printf("%s=%s", k, v)
+			first = false
+		}
+		fmt.Println()
+		
+		if len(series.Value) >= 2 {
+			ts := int64(series.Value[0].(float64))
+			val := series.Value[1].(string)
+			fmt.Printf("Value: %s (at %s)\n", val, time.Unix(ts, 0).Format("2006-01-02 15:04:05"))
+		}
+	}
+	fmt.Println()
+	
+	return nil
+}
+
+func handleQueryRange(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("query_range requires: <metric> [<start_ts> <end_ts>]")
+	}
+
+	// Reconstruct the full query string in case it contains spaces (e.g., aggregation functions)
+	// Find where the metric query ends and timestamps begin
+	var metric string
+	var startTs, endTs int64
+	var err error
+
+	// If only one argument, it's just the metric (instant query)
+	if len(args) == 1 {
+		metric = args[0]
+		// Use instant query API instead
+		return handleInstantQuery(metric)
+	}
+
+	// If we have 3+ args, need to figure out where metric ends
+	// Common patterns:
+	// - "cpu_usage" "0" "now"
+	// - "sum(cpu_usage)" "0" "now"
+	// - "sum(cpu_usage) by (host)" "0" "now"
+	
+	// Try to parse last two args as timestamps first
+	if len(args) >= 3 {
+		// Check if last two arguments could be timestamps
+		testStart, err1 := parseTimestamp(args[len(args)-2])
+		testEnd, err2 := parseTimestamp(args[len(args)-1])
+		
+		if err1 == nil && err2 == nil {
+			// Last two are timestamps, everything before is the metric
+			metric = strings.Join(args[:len(args)-2], " ")
+			startTs = testStart
+			endTs = testEnd
+		} else {
+			// Couldn't parse as timestamps, try old behavior
+			metric = args[0]
+			startTs, err = parseTimestamp(args[1])
+			if err != nil {
+				return fmt.Errorf("invalid start timestamp: %w", err)
+			}
+			endTs, err = parseTimestamp(args[2])
+			if err != nil {
+				return fmt.Errorf("invalid end timestamp: %w", err)
+			}
+		}
+	} else if len(args) == 2 {
+		// Two args: metric and one timestamp? Treat as instant query with time
+		metric = args[0]
+		queryTime, err := parseTimestamp(args[1])
+		if err != nil {
+			return fmt.Errorf("invalid timestamp: %w", err)
+		}
+		return handleInstantQueryWithTime(metric, queryTime)
 	}
 
 	// Build GET request URL with query parameters

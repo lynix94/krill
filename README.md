@@ -7,6 +7,7 @@
 - **Gorilla 압축 알고리즘**: 타임스탬프와 값을 효율적으로 압축
 - **메모리/영구 저장소**: 메모리 기반 또는 BadgerDB 영구 저장소 지원
 - **Tag/Label 지원**: Prometheus 스타일 다차원 메트릭 (예: `cpu{host="server1",env="prod"}`)
+- **PromQL 집계 함수**: sum, avg, min, max, count, stddev, topk, quantile 등 지원
 - **고성능**: 빠른 읽기/쓰기 (33k+ writes/sec, 3M+ reads/sec)
 - **Thread-safe**: 동시성 안전한 구현
 - **TTL 지원**: 시간 기반 데이터 만료
@@ -313,7 +314,29 @@ QUERY=$(printf 'cpu_usage{env="prod"}' | jq -sRr @uri)
 curl "http://localhost:9090/api/v1/query?query=$QUERY"
 ```
 
-**See [TAG_SUPPORT.md](TAG_SUPPORT.md) for complete tag/label documentation.**
+#### 3b. PromQL Aggregation Functions
+
+```bash
+# Sum all CPU usage
+curl 'http://localhost:9090/api/v1/query?query=sum(cpu_usage)'
+
+# Average by environment
+curl 'http://localhost:9090/api/v1/query?query=avg(cpu_usage)%20by%20(env)'
+
+# Top 5 highest values
+curl 'http://localhost:9090/api/v1/query?query=topk(5,%20cpu_usage)'
+
+# 95th percentile
+curl 'http://localhost:9090/api/v1/query?query=quantile(0.95,%20response_time)'
+```
+
+**Supported aggregation functions:**
+- `sum`, `avg`, `min`, `max`, `count`
+- `stddev`, `stdvar`
+- `topk`, `bottomk`
+- `quantile`, `count_values`
+
+**See [docs/PROMQL_AGGREGATIONS.md](docs/PROMQL_AGGREGATIONS.md) for complete documentation.**
 
 #### 4. List Metrics
 
