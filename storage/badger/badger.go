@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -16,9 +17,10 @@ import (
 
 // BadgerTSDB is a persistent time-series database using BadgerDB
 type BadgerTSDB struct {
-	db     *badger.DB
-	ttl    time.Duration
-	labels map[uint64]storage.Labels // seriesID -> labels mapping
+	db         *badger.DB
+	ttl        time.Duration
+	labels     map[uint64]storage.Labels // seriesID -> labels mapping
+	labelsMu   sync.RWMutex              // Protects labels map
 }
 
 // BadgerOptions contains configuration for BadgerTSDB
@@ -61,8 +63,10 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 func (bdb *BadgerTSDB) PutLabels(ts int64, labels storage.Labels, value float64) error {
 	seriesID := labels.Hash()
 	
-	// Store labels mapping in memory
+	// Store labels mapping in memory with proper locking
+	bdb.labelsMu.Lock()
 	bdb.labels[seriesID] = labels.Copy()
+	bdb.labelsMu.Unlock()
 	
 	// Store labels metadata in BadgerDB for persistence
 	if err := bdb.storeLabelsMetadata(seriesID, labels); err != nil {
@@ -249,10 +253,12 @@ func (bdb *BadgerTSDB) Get(metric string, startTs, endTs int64) ([]int64, []floa
 
 // GetAllSeries returns all series (labels) in the database
 func (bdb *BadgerTSDB) GetAllSeries() ([]storage.Labels, error) {
+	bdb.labelsMu.RLock()
 	result := make([]storage.Labels, 0, len(bdb.labels))
 	for _, labels := range bdb.labels {
 		result = append(result, labels.Copy())
 	}
+	bdb.labelsMu.RUnlock()
 	return result, nil
 }
 
@@ -260,10 +266,12 @@ func (bdb *BadgerTSDB) GetAllSeries() ([]storage.Labels, error) {
 func (bdb *BadgerTSDB) GetMetrics() ([]string, error) {
 	metrics := make(map[string]bool)
 
+	bdb.labelsMu.RLock()
 	for _, labels := range bdb.labels {
 		metricStr := formatLabelsAsMetricString(labels)
 		metrics[metricStr] = true
 	}
+	bdb.labelsMu.RUnlock()
 
 	result := make([]string, 0, len(metrics))
 	for metric := range metrics {
@@ -331,8 +339,10 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 			}
 		}
 
-		// Update labels map
+		// Update labels map with proper locking
+		bdb.labelsMu.Lock()
 		bdb.labels = loadedSeries
+		bdb.labelsMu.Unlock()
 		return nil
 	})
 	

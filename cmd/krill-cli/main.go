@@ -156,12 +156,20 @@ func runInteractive() error {
 	}
 	historyFile := filepath.Join(homeDir, ".krill_history")
 
-	// Configure readline
+	// Configure readline with explicit terminal settings
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:          "krill> ",
-		HistoryFile:     historyFile,
-		InterruptPrompt: "^C",
-		EOFPrompt:       "exit",
+		Prompt:                 "krill> ",
+		HistoryFile:            historyFile,
+		InterruptPrompt:        "^C",
+		EOFPrompt:              "exit",
+		VimMode:                false,
+		Stdin:                  readline.NewCancelableStdin(os.Stdin),
+		Stdout:                 os.Stdout,
+		Stderr:                 os.Stderr,
+		DisableAutoSaveHistory: false,
+		FuncFilterInputRune: func(r rune) (rune, bool) {
+			return r, true
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize readline: %w", err)
@@ -171,6 +179,13 @@ func runInteractive() error {
 	fmt.Println("Krill CLI - Interactive Mode")
 	fmt.Printf("Connected to: %s\n", serverURL)
 	fmt.Println("Type 'help' for usage, 'exit' to quit")
+	fmt.Println()
+	fmt.Println("Keyboard shortcuts:")
+	fmt.Println("  Home / Ctrl+A  - Move to beginning of line")
+	fmt.Println("  End / Ctrl+E   - Move to end of line")
+	fmt.Println("  Ctrl+W         - Delete word before cursor")
+	fmt.Println("  Ctrl+U         - Clear line")
+	fmt.Println("  Up/Down        - Navigate command history")
 	fmt.Println()
 
 	for {
@@ -295,8 +310,14 @@ func handleQueryRange(args []string) error {
 		return nil
 	}
 
+	// Print summary
+	fmt.Printf("Found %d series\n", len(result.Data.Result))
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Println()
+
 	// Print results for each series
-	for _, series := range result.Data.Result {
+	for idx, series := range result.Data.Result {
+		fmt.Printf("[Series %d/%d]\n", idx+1, len(result.Data.Result))
 		// Print metric labels
 		fmt.Printf("Metric: ")
 		first := true
@@ -488,16 +509,31 @@ func parseRelativeTime(s string) (int64, error) {
 }
 
 func handleMetrics(args []string) error {
-	// Optional filter argument
-	filter := ""
+	// First argument is metric name filter, rest are label filters
+	metricFilter := ""
+	labelFilters := make(map[string]string)
+	
 	if len(args) > 0 {
-		filter = args[0]
+		metricFilter = args[0]
+		
+		// Parse label filters from remaining arguments (format: key="value" or key=value)
+		for _, arg := range args[1:] {
+			parts := strings.SplitN(arg, "=", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid label filter format '%s' (use key=value or key=\"value\")", arg)
+			}
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			// Remove quotes if present
+			value = strings.Trim(value, "\"'")
+			labelFilters[key] = value
+		}
 	}
 
-	// Build URL with optional filter
+	// Build URL with optional metric name filter
 	queryURL := serverURL + "/api/v1/metrics"
-	if filter != "" {
-		queryURL += "?filter=" + url.QueryEscape(filter)
+	if metricFilter != "" {
+		queryURL += "?filter=" + url.QueryEscape(metricFilter)
 	}
 
 	resp, err := http.Get(queryURL)
@@ -525,19 +561,61 @@ func handleMetrics(args []string) error {
 		return fmt.Errorf("server error: %s", result.Error)
 	}
 
+	// Apply label filters if specified
+	filteredMetrics := result.Data
+	if len(labelFilters) > 0 {
+		filteredMetrics = []string{}
+		for _, metric := range result.Data {
+			if matchesLabelFilters(metric, labelFilters) {
+				filteredMetrics = append(filteredMetrics, metric)
+			}
+		}
+	}
+
 	// Print metrics
-	if len(result.Data) == 0 {
+	if len(filteredMetrics) == 0 {
 		fmt.Println("No metrics found")
 		fmt.Println("\nTotal: 0 metrics")
 		return nil
 	}
 
-	fmt.Printf("Found %d metric(s):\n\n", len(result.Data))
-	for _, metric := range result.Data {
+	fmt.Printf("Found %d metric(s):\n\n", len(filteredMetrics))
+	for _, metric := range filteredMetrics {
 		fmt.Println(metric)
 	}
 	
-	fmt.Printf("\nTotal: %d metrics\n", len(result.Data))
+	fmt.Printf("\nTotal: %d metrics\n", len(filteredMetrics))
 
 	return nil
+}
+
+// matchesLabelFilters checks if a metric string matches the given label filters
+func matchesLabelFilters(metric string, filters map[string]string) bool {
+	// Parse labels from metric string (format: metric_name{label1="value1",label2="value2"})
+	labelStart := strings.Index(metric, "{")
+	if labelStart == -1 {
+		// No labels in metric
+		return len(filters) == 0
+	}
+	
+	labelEnd := strings.LastIndex(metric, "}")
+	if labelEnd == -1 || labelEnd <= labelStart {
+		return false
+	}
+	
+	labelStr := metric[labelStart+1 : labelEnd]
+	
+	// Check if all filters match by searching in the label string
+	// This is faster than parsing all labels
+	for key, value := range filters {
+		// Look for key="value" or key='value' pattern
+		pattern1 := key + `="` + value + `"`
+		pattern2 := key + `='` + value + `'`
+		
+		if !strings.Contains(labelStr, pattern1) && !strings.Contains(labelStr, pattern2) {
+			return false
+		}
+	}
+	
+	return true
 }
