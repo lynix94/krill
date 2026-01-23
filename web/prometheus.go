@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -230,19 +231,46 @@ func (ph *PrometheusHandler) HandleWrite(w http.ResponseWriter, r *http.Request)
 	ph.sendSuccess(w, nil)
 }
 
-// HandleMetrics returns list of all metrics: GET /api/v1/label/__name__/values
+// HandleMetrics returns list of all metrics: GET /api/v1/label/__name__/values or GET /api/v1/metrics
+// Supports optional 'filter' query parameter with regex pattern
 func (ph *PrometheusHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	metrics, err := ph.tsdb.GetMetrics()
+	// Get filter parameter (optional)
+	filterParam := r.URL.Query().Get("filter")
+
+	// Get all metrics from TSDB
+	allMetrics, err := ph.tsdb.GetMetrics()
 	if err != nil {
 		ph.sendError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	ph.sendSuccess(w, metrics)
+
+	var filteredMetrics []string
+
+	// If no filter specified, return all metrics
+	if filterParam == "" {
+		filteredMetrics = allMetrics
+	} else {
+		// Compile regex filter
+		filterRegex, err := regexp.Compile(filterParam)
+		if err != nil {
+			ph.sendError(w, http.StatusBadRequest, fmt.Sprintf("invalid filter regex: %v", err))
+			return
+		}
+
+		// Filter metrics using regex
+		for _, metric := range allMetrics {
+			if filterRegex.MatchString(metric) {
+				filteredMetrics = append(filteredMetrics, metric)
+			}
+		}
+	}
+
+	ph.sendSuccess(w, filteredMetrics)
 }
 
 // buildMetricKey creates a metric key with tags

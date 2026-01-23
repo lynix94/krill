@@ -275,6 +275,7 @@ const dashboardHTML = `<!DOCTYPE html>
         <div class="tabs">
             <button class="tab-button active" onclick="switchTab('read')">🔍 Read / Query</button>
             <button class="tab-button" onclick="switchTab('write')">✏️ Write Data</button>
+            <button class="tab-button" onclick="switchTab('metrics')">📋 Metrics List</button>
         </div>
 
         <!-- Read Tab -->
@@ -369,6 +370,39 @@ const dashboardHTML = `<!DOCTYPE html>
                     <div class="stat-card">
                         <div class="value" id="writeCount2">0</div>
                         <div class="label">Writes</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Metrics Tab -->
+        <div id="metricsTab" class="tab-content">
+            <div class="panel">
+                <h2>📋 Metrics List</h2>
+                <div class="form-group">
+                    <label for="metricsFilter">Filter (regex):</label>
+                    <input type="text" id="metricsFilter" placeholder="e.g., cpu|memory, ^http, usage$" onkeyup="filterMetrics()">
+                </div>
+                <button onclick="loadAllMetrics()">Refresh Metrics</button>
+                
+                <div id="metricsResult" class="result-box" style="margin-top: 20px;">
+                    <div style="text-align: center; padding: 40px; color: #999;">
+                        Click "Refresh Metrics" to load the metrics list
+                    </div>
+                </div>
+
+                <div class="stats" style="margin-top: 30px;">
+                    <div class="stat-card">
+                        <div class="value" id="metricCount3">-</div>
+                        <div class="label">Total Metrics</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="value" id="filteredMetricCount">-</div>
+                        <div class="label">Filtered Metrics</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="value" id="lastUpdate">-</div>
+                        <div class="label">Last Update</div>
                     </div>
                 </div>
             </div>
@@ -702,6 +736,66 @@ const dashboardHTML = `<!DOCTYPE html>
             setTimeout(() => {
                 resultDiv.style.display = 'none';
             }, 5000);
+        }
+
+        // Metrics List Functions
+        let cachedMetrics = [];
+        
+        async function loadAllMetrics() {
+            try {
+                const filter = document.getElementById('metricsFilter').value.trim();
+                const url = filter ? '/api/v1/metrics?filter=' + encodeURIComponent(filter) : '/api/v1/metrics';
+                
+                const response = await fetch(url);
+                const data = await response.json();
+                
+                if (data.status === 'success') {
+                    cachedMetrics = data.data || [];
+                    displayMetrics(cachedMetrics);
+                    
+                    // Update stats
+                    const now = new Date().toLocaleTimeString();
+                    document.getElementById('lastUpdate').textContent = now;
+                } else {
+                    document.getElementById('metricsResult').innerHTML = 
+                        '<div class="alert alert-error">Error: ' + data.error + '</div>';
+                }
+            } catch (error) {
+                document.getElementById('metricsResult').innerHTML = 
+                    '<div class="alert alert-error">Error loading metrics: ' + error.message + '</div>';
+            }
+        }
+
+        function displayMetrics(metrics) {
+            const resultDiv = document.getElementById('metricsResult');
+            
+            if (!metrics || metrics.length === 0) {
+                resultDiv.innerHTML = '<div style="text-align: center; padding: 40px; color: #999;">No metrics found</div>';
+                document.getElementById('filteredMetricCount').textContent = '0';
+                return;
+            }
+
+            let html = '<div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">';
+            html += '<strong>Total: ' + metrics.length + ' metrics</strong>';
+            html += '</div>';
+            html += '<div style="max-height: 500px; overflow-y: auto; background: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px;">';
+            
+            metrics.forEach((metric, index) => {
+                html += '<div style="padding: 8px; border-bottom: 1px solid #eee; font-family: monospace; font-size: 0.95em;">';
+                html += (index + 1) + '. ' + metric;
+                html += '</div>';
+            });
+            
+            html += '</div>';
+            resultDiv.innerHTML = html;
+            
+            // Update stats
+            document.getElementById('metricCount3').textContent = allMetrics.length || metrics.length;
+            document.getElementById('filteredMetricCount').textContent = metrics.length;
+        }
+
+        function filterMetrics() {
+            loadAllMetrics();
         }
     </script>
 </body>
