@@ -87,6 +87,21 @@ func (h *HybridTSDB) TsdbPut(ts int64, metric string, value float64) error {
 	return nil
 }
 
+// PutLabels stores a data point with labels in both memory cache and persistent storage (dual write)
+func (h *HybridTSDB) PutLabels(ts int64, labels storage.Labels, value float64) error {
+	// Write to memory cache first (fast path)
+	if err := h.memoryCache.PutLabels(ts, labels, value); err != nil {
+		return fmt.Errorf("failed to write to memory cache: %w", err)
+	}
+
+	// Write to persistent storage for durability
+	if err := h.persistStorage.PutLabels(ts, labels, value); err != nil {
+		return fmt.Errorf("failed to write to persistent storage: %w", err)
+	}
+
+	return nil
+}
+
 // Get retrieves data points, trying memory cache first, then persistent storage
 func (h *HybridTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float64, error) {
 	if endTs == 0 {
@@ -100,32 +115,41 @@ func (h *HybridTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float6
 	now := time.Now().Unix()
 	cacheCutoff := now - int64(h.cacheDuration.Seconds())
 
-	// If query is entirely within cache range, use cache only
-	if startTs >= cacheCutoff {
-		return h.memoryCache.Get(metric, startTs, endTs)
+	// If query is entirely in the old range (before cache cutoff), use persistent storage only
+	if endTs < cacheCutoff {
+		return h.persistStorage.Get(metric, startTs, endTs)
 	}
 
-	// Query needs data from persistent storage
-	persistTimestamps, persistValues, err := h.persistStorage.Get(metric, startTs, cacheCutoff-1)
-	if err != nil && !strings.Contains(err.Error(), "metric not found") {
-		return nil, nil, fmt.Errorf("failed to query persistent storage: %w", err)
-	}
-
-	if len(persistTimestamps) > 0 {
-		allTimestamps = append(allTimestamps, persistTimestamps...)
-		allValues = append(allValues, persistValues...)
-	}
-
-	// Get recent data from memory cache
-	cacheTimestamps, cacheValues, err := h.memoryCache.Get(metric, cacheCutoff, endTs)
-	if err != nil && !strings.Contains(err.Error(), "metric not found") {
-		// If not in cache either, return error
-		if len(allTimestamps) == 0 {
-			return nil, nil, fmt.Errorf("metric not found: %s", metric)
+	// Query overlaps with cache range - check both storages
+	// Get old data from persistent storage
+	if startTs < cacheCutoff {
+		persistTimestamps, persistValues, err := h.persistStorage.Get(metric, startTs, cacheCutoff-1)
+		if err != nil && !strings.Contains(err.Error(), "metric not found") {
+			return nil, nil, fmt.Errorf("failed to query persistent storage: %w", err)
+		}
+		if len(persistTimestamps) > 0 {
+			allTimestamps = append(allTimestamps, persistTimestamps...)
+			allValues = append(allValues, persistValues...)
 		}
 	}
 
-	if len(cacheTimestamps) > 0 {
+	// Get recent data from both memory cache AND persistent storage
+	// (persistent storage has data written before restart)
+	cacheStart := cacheCutoff
+	if startTs > cacheStart {
+		cacheStart = startTs
+	}
+
+	// Get from persistent storage (includes data from before restart)
+	persistRecentTs, persistRecentVals, err := h.persistStorage.Get(metric, cacheStart, endTs)
+	if err == nil && len(persistRecentTs) > 0 {
+		allTimestamps = append(allTimestamps, persistRecentTs...)
+		allValues = append(allValues, persistRecentVals...)
+	}
+
+	// Also get from memory cache (includes data after restart)
+	cacheTimestamps, cacheValues, err := h.memoryCache.Get(metric, cacheStart, endTs)
+	if err == nil && len(cacheTimestamps) > 0 {
 		allTimestamps = append(allTimestamps, cacheTimestamps...)
 		allValues = append(allValues, cacheValues...)
 	}
@@ -133,6 +157,71 @@ func (h *HybridTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float6
 	if len(allTimestamps) == 0 {
 		return nil, nil, fmt.Errorf("metric not found: %s", metric)
 	}
+
+	// Deduplicate and sort by timestamp
+	allTimestamps, allValues = deduplicateTimeseries(allTimestamps, allValues)
+
+	return allTimestamps, allValues, nil
+}
+
+// GetLabels retrieves data points by labels, trying memory cache first for recent data
+func (h *HybridTSDB) GetLabels(labels storage.Labels, startTs, endTs int64) ([]int64, []float64, error) {
+	if endTs == 0 {
+		endTs = 1<<63 - 1 // Max int64
+	}
+
+	var allTimestamps []int64
+	var allValues []float64
+
+	// Calculate cache cutoff (e.g., 2 hours ago)
+	now := time.Now().Unix()
+	cacheCutoff := now - int64(h.cacheDuration.Seconds())
+
+	// If query is entirely in the old range (before cache cutoff), use persistent storage only
+	if endTs < cacheCutoff {
+		return h.persistStorage.GetLabels(labels, startTs, endTs)
+	}
+
+	// Query overlaps with cache range - check both storages
+	// Get old data from persistent storage
+	if startTs < cacheCutoff {
+		persistTimestamps, persistValues, err := h.persistStorage.GetLabels(labels, startTs, cacheCutoff-1)
+		if err != nil && !strings.Contains(err.Error(), "metric not found") && !strings.Contains(err.Error(), "series not found") {
+			return nil, nil, fmt.Errorf("failed to query persistent storage: %w", err)
+		}
+		if len(persistTimestamps) > 0 {
+			allTimestamps = append(allTimestamps, persistTimestamps...)
+			allValues = append(allValues, persistValues...)
+		}
+	}
+
+	// Get recent data from both memory cache AND persistent storage
+	// (persistent storage has data written before restart)
+	cacheStart := cacheCutoff
+	if startTs > cacheStart {
+		cacheStart = startTs
+	}
+
+	// Get from persistent storage (includes data from before restart)
+	persistRecentTs, persistRecentVals, err := h.persistStorage.GetLabels(labels, cacheStart, endTs)
+	if err == nil && len(persistRecentTs) > 0 {
+		allTimestamps = append(allTimestamps, persistRecentTs...)
+		allValues = append(allValues, persistRecentVals...)
+	}
+
+	// Also get from memory cache (includes data after restart)
+	cacheTimestamps, cacheValues, err := h.memoryCache.GetLabels(labels, cacheStart, endTs)
+	if err == nil && len(cacheTimestamps) > 0 {
+		allTimestamps = append(allTimestamps, cacheTimestamps...)
+		allValues = append(allValues, cacheValues...)
+	}
+
+	if len(allTimestamps) == 0 {
+		return nil, nil, fmt.Errorf("series not found: %s", labels.String())
+	}
+
+	// Deduplicate and sort by timestamp
+	allTimestamps, allValues = deduplicateTimeseries(allTimestamps, allValues)
 
 	return allTimestamps, allValues, nil
 }
@@ -166,6 +255,37 @@ func (h *HybridTSDB) GetMetrics() ([]string, error) {
 	}
 
 	return metrics, nil
+}
+
+// GetAllSeries returns all series (labels) from both cache and persistent storage
+func (h *HybridTSDB) GetAllSeries() ([]storage.Labels, error) {
+	seriesMap := make(map[uint64]storage.Labels)
+
+	// Get from memory cache
+	cacheSeries, err := h.memoryCache.GetAllSeries()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cache series: %w", err)
+	}
+	for _, labels := range cacheSeries {
+		seriesMap[labels.Hash()] = labels
+	}
+
+	// Get from persistent storage
+	persistSeries, err := h.persistStorage.GetAllSeries()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get persistent series: %w", err)
+	}
+	for _, labels := range persistSeries {
+		seriesMap[labels.Hash()] = labels
+	}
+
+	// Convert to slice
+	series := make([]storage.Labels, 0, len(seriesMap))
+	for _, labels := range seriesMap {
+		series = append(series, labels)
+	}
+
+	return series, nil
 }
 
 // Close closes both storage backends and stops cleanup
@@ -225,4 +345,40 @@ func (h *HybridTSDB) RunGC() error {
 		return ps.RunGC()
 	}
 	return nil
+}
+
+// deduplicateTimeseries removes duplicate timestamps and sorts the result
+func deduplicateTimeseries(timestamps []int64, values []float64) ([]int64, []float64) {
+	if len(timestamps) == 0 {
+		return timestamps, values
+	}
+
+	// Create a map of timestamp -> value (later values overwrite earlier ones)
+	tsMap := make(map[int64]float64, len(timestamps))
+	for i, ts := range timestamps {
+		tsMap[ts] = values[i]
+	}
+
+	// Sort timestamps
+	sortedTs := make([]int64, 0, len(tsMap))
+	for ts := range tsMap {
+		sortedTs = append(sortedTs, ts)
+	}
+	
+	// Sort using a simple bubble sort for small datasets or use sort package
+	for i := 0; i < len(sortedTs)-1; i++ {
+		for j := i + 1; j < len(sortedTs); j++ {
+			if sortedTs[i] > sortedTs[j] {
+				sortedTs[i], sortedTs[j] = sortedTs[j], sortedTs[i]
+			}
+		}
+	}
+
+	// Extract sorted values
+	sortedVals := make([]float64, len(sortedTs))
+	for i, ts := range sortedTs {
+		sortedVals[i] = tsMap[ts]
+	}
+
+	return sortedTs, sortedVals
 }

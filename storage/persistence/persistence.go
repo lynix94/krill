@@ -1,6 +1,7 @@
 package persistence
 
 import (
+	"github.com/lynix/krill/storage"
 	"github.com/lynix/krill/storage/badger"
 )
 
@@ -23,14 +24,29 @@ func (ps *PersistenceStorage) Put(ts int64, metric string, value float64) error 
 	return ps.db.TsdbPut(ts, metric, value)
 }
 
+// PutLabels stores a data point with labels
+func (ps *PersistenceStorage) PutLabels(ts int64, labels storage.Labels, value float64) error {
+	return ps.db.PutLabels(ts, labels, value)
+}
+
 // Get retrieves data points for a metric within a time range
 func (ps *PersistenceStorage) Get(metric string, startTs, endTs int64) ([]int64, []float64, error) {
 	return ps.db.Get(metric, startTs, endTs)
 }
 
+// GetLabels retrieves data points by labels within a time range
+func (ps *PersistenceStorage) GetLabels(labels storage.Labels, startTs, endTs int64) ([]int64, []float64, error) {
+	return ps.db.GetLabels(labels, startTs, endTs)
+}
+
 // GetMetrics returns all metric names
 func (ps *PersistenceStorage) GetMetrics() ([]string, error) {
 	return ps.db.GetMetrics()
+}
+
+// GetAllSeries returns all series
+func (ps *PersistenceStorage) GetAllSeries() ([]storage.Labels, error) {
+	return ps.db.GetAllSeries()
 }
 
 // Close closes the storage

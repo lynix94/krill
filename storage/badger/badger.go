@@ -42,19 +42,32 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 		return nil, fmt.Errorf("failed to open BadgerDB: %w", err)
 	}
 
-	return &BadgerTSDB{
+	bdb := &BadgerTSDB{
 		db:     db,
 		ttl:    opts.TTL,
 		labels: make(map[uint64]storage.Labels),
-	}, nil
+	}
+
+	// Load all series labels from database
+	if err := bdb.loadAllSeries(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to load series: %w", err)
+	}
+
+	return bdb, nil
 }
 
 // PutLabels stores a time-series data point with Gorilla compression using Labels
 func (bdb *BadgerTSDB) PutLabels(ts int64, labels storage.Labels, value float64) error {
 	seriesID := labels.Hash()
 	
-	// Store labels mapping
+	// Store labels mapping in memory
 	bdb.labels[seriesID] = labels.Copy()
+	
+	// Store labels metadata in BadgerDB for persistence
+	if err := bdb.storeLabelsMetadata(seriesID, labels); err != nil {
+		return fmt.Errorf("failed to store labels metadata: %w", err)
+	}
 	
 	// Create time-partitioned key: seriesID:timestamp_bucket
 	// Use hourly buckets for better read performance
@@ -234,13 +247,13 @@ func (bdb *BadgerTSDB) Get(metric string, startTs, endTs int64) ([]int64, []floa
 	return bdb.GetLabels(labels, startTs, endTs)
 }
 
-// GetAllSeries returns all series (seriesID -> labels) in the database
-func (bdb *BadgerTSDB) GetAllSeries() map[uint64]storage.Labels {
-	result := make(map[uint64]storage.Labels)
-	for id, labels := range bdb.labels {
-		result[id] = labels.Copy()
+// GetAllSeries returns all series (labels) in the database
+func (bdb *BadgerTSDB) GetAllSeries() ([]storage.Labels, error) {
+	result := make([]storage.Labels, 0, len(bdb.labels))
+	for _, labels := range bdb.labels {
+		result = append(result, labels.Copy())
 	}
-	return result
+	return result, nil
 }
 
 // GetMetrics returns all metric names (legacy API, returns formatted strings)
@@ -268,6 +281,155 @@ func (bdb *BadgerTSDB) Close() error {
 // RunGC runs garbage collection to reclaim disk space
 func (bdb *BadgerTSDB) RunGC() error {
 	return bdb.db.RunValueLogGC(0.5)
+}
+
+// loadAllSeries scans the database and loads all series labels into memory
+func (bdb *BadgerTSDB) loadAllSeries() error {
+	var skippedCount int
+	var loadedCount int
+	
+	err := bdb.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		opts.Prefix = []byte("meta:")
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		loadedSeries := make(map[uint64]storage.Labels)
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := item.Key()
+			
+			// Extract seriesID from key "meta:seriesID"
+			if len(key) < 13 { // "meta:" (5 bytes) + uint64 (8 bytes)
+				continue
+			}
+			seriesID := binary.BigEndian.Uint64(key[5:])
+			
+			// Read labels from value
+			err := item.Value(func(val []byte) error {
+				// Skip empty values
+				if len(val) == 0 {
+					return nil
+				}
+				labels, err := deserializeLabels(val)
+				if err != nil {
+					// Log error but continue loading other series
+					fmt.Printf("Warning: skipping corrupted series metadata (ID=%d): %v\n", seriesID, err)
+					skippedCount++
+					return nil // Don't fail, just skip this series
+				}
+				loadedSeries[seriesID] = labels
+				loadedCount++
+				return nil
+			})
+			if err != nil {
+				// This shouldn't happen now since we return nil on error above
+				fmt.Printf("Warning: failed to read series metadata (ID=%d): %v\n", seriesID, err)
+				skippedCount++
+			}
+		}
+
+		// Update labels map
+		bdb.labels = loadedSeries
+		return nil
+	})
+	
+	if err != nil {
+		return err
+	}
+	
+	if skippedCount > 0 {
+		fmt.Printf("Loaded %d series, skipped %d corrupted series\n", loadedCount, skippedCount)
+	}
+	
+	return nil
+}
+
+// storeLabelsMetadata stores series labels in a separate metadata key
+func (bdb *BadgerTSDB) storeLabelsMetadata(seriesID uint64, labels storage.Labels) error {
+	return bdb.db.Update(func(txn *badger.Txn) error {
+		key := makeMetadataKey(seriesID)
+		val := serializeLabels(labels)
+		return txn.Set(key, val)
+	})
+}
+
+// makeMetadataKey creates a metadata key for series labels
+func makeMetadataKey(seriesID uint64) []byte {
+	key := make([]byte, 13) // "meta:" (5 bytes) + uint64 (8 bytes)
+	copy(key, []byte("meta:"))
+	binary.BigEndian.PutUint64(key[5:], seriesID)
+	return key
+}
+
+// serializeLabels serializes labels to bytes
+func serializeLabels(labels storage.Labels) []byte {
+	buf := new(bytes.Buffer)
+	
+	// Write number of labels
+	binary.Write(buf, binary.BigEndian, uint32(len(labels)))
+	
+	// Write each label
+	for _, label := range labels {
+		// Write name length and name
+		binary.Write(buf, binary.BigEndian, uint32(len(label.Name)))
+		buf.Write([]byte(label.Name))
+		
+		// Write value length and value
+		binary.Write(buf, binary.BigEndian, uint32(len(label.Value)))
+		buf.Write([]byte(label.Value))
+	}
+	
+	return buf.Bytes()
+}
+
+// deserializeLabels deserializes labels from bytes
+func deserializeLabels(data []byte) (storage.Labels, error) {
+	if len(data) == 0 {
+		return storage.Labels{}, nil
+	}
+	
+	buf := bytes.NewReader(data)
+	
+	// Read number of labels
+	var count uint32
+	if err := binary.Read(buf, binary.BigEndian, &count); err != nil {
+		return nil, fmt.Errorf("failed to read label count: %w", err)
+	}
+	
+	labels := make(storage.Labels, count)
+	
+	// Read each label
+	for i := uint32(0); i < count; i++ {
+		// Read name
+		var nameLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &nameLen); err != nil {
+			return nil, fmt.Errorf("failed to read label[%d] name length: %w", i, err)
+		}
+		nameBuf := make([]byte, nameLen)
+		if _, err := buf.Read(nameBuf); err != nil {
+			return nil, fmt.Errorf("failed to read label[%d] name: %w", i, err)
+		}
+		
+		// Read value
+		var valueLen uint32
+		if err := binary.Read(buf, binary.BigEndian, &valueLen); err != nil {
+			return nil, fmt.Errorf("failed to read label[%d] value length: %w", i, err)
+		}
+		valueBuf := make([]byte, valueLen)
+		if _, err := buf.Read(valueBuf); err != nil {
+			return nil, fmt.Errorf("failed to read label[%d] value: %w", i, err)
+		}
+		
+		labels[i] = storage.Label{
+			Name:  string(nameBuf),
+			Value: string(valueBuf),
+		}
+	}
+	
+	return labels, nil
 }
 
 // SeriesBlock represents a compressed time series block

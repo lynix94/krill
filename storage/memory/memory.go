@@ -197,15 +197,15 @@ func (ms *MemoryStorage) GetMetrics() ([]string, error) {
 }
 
 // GetAllSeries returns all series with their labels
-func (ms *MemoryStorage) GetAllSeries() map[uint64]storage.Labels {
+func (ms *MemoryStorage) GetAllSeries() ([]storage.Labels, error) {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
 
-	result := make(map[uint64]storage.Labels, len(ms.labels))
-	for id, labels := range ms.labels {
-		result[id] = labels.Copy()
+	result := make([]storage.Labels, 0, len(ms.labels))
+	for _, labels := range ms.labels {
+		result = append(result, labels.Copy())
 	}
-	return result
+	return result, nil
 }
 
 // Close closes the storage (no-op for memory storage)
