@@ -1,0 +1,63 @@
+# Krill TSDB Scraper Configuration
+# This file defines how to scrape metrics from Prometheus exporters
+
+global:
+  # Default scrape interval for all jobs
+  scrape_interval: 15s
+  
+  # Default timeout for scrape requests
+  scrape_timeout: 10s
+
+# Scrape job configurations
+scrape_configs:
+  # Example: Node Exporter (system metrics)
+  - job_name: 'node'
+    scrape_interval: 30s
+    metrics_path: '/metrics'
+    metric_prefix: 'node'
+    static_configs:
+      - targets:
+          - 'localhost:9100'
+        labels:
+          environment: 'production'
+          datacenter: 'dc1'
+
+  # Example: Prometheus itself (self-monitoring)
+  - job_name: 'prometheus'
+    scrape_interval: 15s
+    metrics_path: '/metrics'
+    metric_prefix: 'prometheus'
+    static_configs:
+      - targets:
+          - 'localhost:9090'
+
+#  # Example: Custom application metrics
+#  - job_name: 'myapp'
+#    scrape_interval: 10s
+#    metrics_path: '/metrics'
+#    metric_prefix: 'app'
+#    labels:
+#      team: 'backend'
+#    static_configs:
+#      - targets:
+#          - 'localhost:8080'
+#          - 'localhost:8081'
+#        labels:
+#          cluster: 'main'
+#
+#  # Example: Multiple targets with different labels
+#  - job_name: 'databases'
+#    scrape_interval: 30s
+#    metrics_path: '/metrics'
+#    metric_prefix: 'db'
+#    static_configs:
+#      - targets:
+#          - 'db1.example.com:9187'
+#        labels:
+#          role: 'primary'
+#          type: 'postgres'
+#      - targets:
+#          - 'db2.example.com:9187'
+#        labels:
+#          role: 'replica'
+#          type: 'postgres'

@@ -1,0 +1,153 @@
+cat << 'EOF'
+╔════════════════════════════════════════════════════════════════╗
+║                  Krill TSDB Scraper Guide                      ║
+╚════════════════════════════════════════════════════════════════╝
+
+📦 WHAT IS IT?
+   The Krill scraper automatically collects metrics from Prometheus
+   exporters and sends them to a Krill server via HTTP API.
+
+🎯 USE CASES:
+   • Collect system metrics (CPU, memory, disk) from Node Exporter
+   • Monitor applications with custom Prometheus exporters
+   • Aggregate metrics from multiple services
+   • Send metrics to centralized Krill server
+
+📋 CONFIGURATION FILE: scraper.yaml
+   
+   Example structure:
+   
+   global:
+     scrape_interval: 15s    # How often to collect metrics
+     scrape_timeout: 10s     # Request timeout
+   
+   scrape_configs:
+     - job_name: 'my-service'
+       metrics_path: '/metrics'
+       metric_prefix: 'app'   # Prefix for metric names
+       static_configs:
+         - targets:
+             - 'localhost:8080'
+           labels:
+             environment: 'prod'
+
+🚀 QUICK START:
+
+   1. Start Krill server:
+      ./krill-server
+   
+   2. Edit scraper.yaml with your exporter targets
+   
+   3. Build the scraper:
+      go build -o krill-scraper ./cmd/krill-scraper
+   
+   4. Run scraper pointing to your server:
+      ./krill-scraper -config scraper.yaml -server http://localhost:9090
+   
+   5. View statistics (printed every minute):
+      - Total scrapes
+      - Success/failure rate
+      - Metrics sent to server
+
+🧪 TRY THE DEMO:
+   
+   Run a complete demo with mock exporter and server:
+   ./demo_scraper.sh
+   
+   This will:
+   - Start Krill server
+   - Start a Python-based mock Prometheus exporter
+   - Configure the scraper to collect from it
+   - Send metrics to Krill server via HTTP API
+   - Display statistics every 15 seconds
+
+📊 COMMAND LINE OPTIONS:
+
+   -config <file>      Config file path (default: scraper.yaml)
+   -server <url>       Krill server URL (default: http://localhost:9090)
+   -stats <duration>   Statistics interval (default: 1m)
+
+💡 EXAMPLES:
+
+   # Basic usage (local server)
+   ./krill-scraper -config scraper.yaml
+   
+   # Connect to remote server
+   ./krill-scraper -config scraper.yaml -server http://krill.example.com:9090
+   
+   # More frequent statistics
+   ./krill-scraper -config scraper.yaml -stats 30s
+   
+   # Custom server port
+   ./krill-scraper -config scraper.yaml -server http://localhost:8080
+
+🔍 METRIC NAMING:
+
+   Collected metrics are sent to the server with this format:
+   [prefix].[metric_name].[job].[instance]
+   
+   Example:
+   - Original: http_requests_total{method="GET"}
+   - Sent as: app.http_requests_total.myapp.localhost
+   - Stored in Krill server TSDB
+
+📈 MONITORING THE SCRAPER:
+
+   The scraper prints statistics periodically:
+   
+   Stats: scrapes=120 (success=115, failed=5, rate=95.8%), metrics=2450
+   
+   This shows:
+   - Total scrape attempts: 120
+   - Successful: 115 (95.8% success rate)
+   - Failed: 5
+   - Metrics sent to server: 2,450 data points
+   
+   Check the Krill server dashboard to see stored metrics:
+   http://localhost:9090
+
+🔧 COMMON EXPORTERS:
+
+   Node Exporter (system metrics):
+     Download: https://prometheus.io/download/#node_exporter
+     Default port: 9100
+     
+   Prometheus (self-monitoring):
+     Built-in at /metrics
+     Default port: 9090
+   
+   Custom Application:
+     Use Prometheus client library for your language
+     Expose /metrics endpoint
+
+⚠️  TROUBLESHOOTING:
+
+   • "Connection refused" (exporter) → Check if exporter is running
+   • "Connection refused" (server) → Check if Krill server is running
+   • "Timeout" → Increase scrape_timeout in config
+   • "No metrics" → Verify metrics_path is correct
+   • "Server returned status 500" → Check Krill server logs
+   • High failure rate → Check network/firewall
+
+🏗️  ARCHITECTURE:
+
+   Prometheus Exporter → Scraper → HTTP API → Krill Server → TSDB
+   
+   The scraper:
+   1. Polls exporters for metrics
+   2. Parses Prometheus text format
+   3. Formats metric names with labels
+   4. Sends via HTTP POST to /api/v1/write
+   5. Krill server stores in TSDB with Gorilla compression
+
+📚 MORE INFO:
+
+   README: ./README.md
+   Config example: ./scraper.yaml
+   API server: ./krill-server
+   Dashboard: http://localhost:9090 (when server running)
+
+╔════════════════════════════════════════════════════════════════╗
+║  Ready to start? Run:  ./demo_scraper.sh                      ║
+╚════════════════════════════════════════════════════════════════╝
+EOF
