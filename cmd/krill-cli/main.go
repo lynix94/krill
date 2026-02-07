@@ -20,8 +20,8 @@ import (
 const usage = `krill-cli - Command line tool for Krill TSDB
 
 Usage:
-  krill-cli -server <url>                                    # Interactive mode
-  krill-cli -server <url> query_range <metric> <start> <end> # Single command
+  krill-cli -server <url>                                              # Interactive mode
+  krill-cli -server <url> query_range <metric> <start> <end> [step]   # Single command
   krill-cli -server <url> put <timestamp> <metric> <value> [...]
 
 Modes:
@@ -34,6 +34,8 @@ Modes:
 
 Commands:
   query_range  Query metric data within a time range
+               Format: query_range <metric> <start> <end> [step]
+               - step: optional sampling interval in seconds (default: auto)
                Alias: query
   put          Insert one or more metric data points
                Alias: write
@@ -43,7 +45,7 @@ Commands:
 
 Options:
   -server string
-        Krill server URL (default "http://localhost:8080")
+        Krill server URL (default "http://localhost:9090")
 
 Timestamp Format:
   - "now" for current timestamp
@@ -61,6 +63,7 @@ Examples:
 
   # Single commands
   krill-cli -server http://localhost:9090 query_range cpu.usage 0 9999999999
+  krill-cli -server http://localhost:9090 query_range rate(cpu.usage[1m]) now-1h now 30
   krill-cli -server http://localhost:9090 put now cpu.usage 45.5
   krill-cli -server http://localhost:9090 metrics
   krill-cli -server http://localhost:9090 metrics "^http"
@@ -101,7 +104,7 @@ type WriteRequest struct {
 }
 
 func main() {
-	flag.StringVar(&serverURL, "server", "http://localhost:8080", "Krill server URL")
+	flag.StringVar(&serverURL, "server", "http://localhost:9090", "Krill server URL")
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
 	}
@@ -393,6 +396,28 @@ func handleInstantQueryWithTime(metric string, queryTime int64) error {
 	return nil
 }
 
+// parseDuration parses duration strings like "1h", "30m", "5s", "2d" and returns seconds
+func parseDuration(s string) (int64, error) {
+	var duration time.Duration
+	var err error
+
+	// Custom parsing for simplified format (e.g., "1h", "30m", "2d")
+	if strings.HasSuffix(s, "d") {
+		days, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		if err != nil {
+			return 0, fmt.Errorf("invalid duration: %w", err)
+		}
+		duration = time.Duration(days) * 24 * time.Hour
+	} else {
+		duration, err = time.ParseDuration(s)
+		if err != nil {
+			return 0, fmt.Errorf("invalid duration: %w", err)
+		}
+	}
+
+	return int64(duration.Seconds()), nil
+}
+
 func handleQueryRange(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("query_range requires: <metric> [<start_ts> <end_ts>]")
@@ -402,6 +427,7 @@ func handleQueryRange(args []string) error {
 	// Find where the metric query ends and timestamps begin
 	var metric string
 	var startTs, endTs int64
+	var customStep int64 = 0 // 0 means auto-detect
 	var err error
 
 	// If only one argument, it's just the metric (instant query)
@@ -411,53 +437,106 @@ func handleQueryRange(args []string) error {
 		return handleInstantQuery(metric)
 	}
 
-	// If we have 3+ args, need to figure out where metric ends
-	// Common patterns:
-	// - "cpu_usage" "0" "now"
-	// - "sum(cpu_usage)" "0" "now"
-	// - "sum(cpu_usage) by (host)" "0" "now"
+	// Parse arguments: <metric> <start> <end> [step]
+	// Expected formats:
+	// - 1 arg: metric (instant query)
+	// - 3 args: metric start end
+	// - 4 args: metric start end step OR "metric query" start end
+	// - 5+ args: error or complex metric query
+	var possibleStep string
+	var timestampArgs []string
 	
-	// Try to parse last two args as timestamps first
-	if len(args) >= 3 {
+	// Reject too many arguments (more than 5 suggests user error)
+	if len(args) > 5 {
+		return fmt.Errorf("too many arguments (max 5: metric, start, end, step, and possibly metric parts)")
+	}
+	
+	if len(args) >= 4 {
+		// Check if 4th argument (index 3) looks like a step parameter
+		// This handles: metric start end step
+		fourthArg := args[3]
+		isStep := false
+		
+		// Check if it's a pure number (seconds)
+		if _, err := strconv.ParseInt(fourthArg, 10, 64); err == nil && !strings.Contains(fourthArg, "now") {
+			isStep = true
+		} else if _, err := parseDuration(fourthArg); err == nil {
+			// Check if it's a duration format (e.g., "1h", "30m", "5s")
+			isStep = true
+		}
+		
+		if isStep {
+			possibleStep = fourthArg
+			timestampArgs = args[:3]
+		} else {
+			timestampArgs = args
+		}
+	} else {
+		timestampArgs = args
+	}
+
+	// Now parse metric and timestamps from timestampArgs
+	if len(timestampArgs) >= 3 {
 		// Check if last two arguments could be timestamps
-		testStart, err1 := parseTimestamp(args[len(args)-2])
-		testEnd, err2 := parseTimestamp(args[len(args)-1])
+		testStart, err1 := parseTimestamp(timestampArgs[len(timestampArgs)-2])
+		testEnd, err2 := parseTimestamp(timestampArgs[len(timestampArgs)-1])
 		
 		if err1 == nil && err2 == nil {
 			// Last two are timestamps, everything before is the metric
-			metric = strings.Join(args[:len(args)-2], " ")
+			metric = strings.Join(timestampArgs[:len(timestampArgs)-2], " ")
 			startTs = testStart
 			endTs = testEnd
 		} else {
 			// Couldn't parse as timestamps, try old behavior
-			metric = args[0]
-			startTs, err = parseTimestamp(args[1])
+			metric = timestampArgs[0]
+			startTs, err = parseTimestamp(timestampArgs[1])
 			if err != nil {
 				return fmt.Errorf("invalid start timestamp: %w", err)
 			}
-			endTs, err = parseTimestamp(args[2])
+			endTs, err = parseTimestamp(timestampArgs[2])
 			if err != nil {
 				return fmt.Errorf("invalid end timestamp: %w", err)
 			}
 		}
-	} else if len(args) == 2 {
+	} else if len(timestampArgs) == 2 {
 		// Two args: metric and one timestamp? Treat as instant query with time
-		metric = args[0]
-		queryTime, err := parseTimestamp(args[1])
+		metric = timestampArgs[0]
+		queryTime, err := parseTimestamp(timestampArgs[1])
 		if err != nil {
 			return fmt.Errorf("invalid timestamp: %w", err)
 		}
 		return handleInstantQueryWithTime(metric, queryTime)
 	}
 
+	// Parse custom step if provided (supports both seconds and duration format)
+	if possibleStep != "" {
+		// Try parsing as integer first (seconds)
+		customStep, err = strconv.ParseInt(possibleStep, 10, 64)
+		if err != nil {
+			// If not an integer, try parsing as duration (e.g., "1h", "30m")
+			customStep, err = parseDuration(possibleStep)
+			if err != nil {
+				return fmt.Errorf("invalid step parameter (use seconds or duration like '30s', '1m', '1h'): %w", err)
+			}
+		}
+		if customStep <= 0 {
+			return fmt.Errorf("step must be positive")
+		}
+	}
+
 	// Build GET request URL with query parameters
-	// Add default step for rate/irate queries
 	queryURL := fmt.Sprintf("%s/api/v1/query_range?query=%s&start=%d&end=%d",
 		serverURL, url.QueryEscape(metric), startTs, endTs)
 	
-	// Auto-add step for rate/irate queries (15 second intervals)
-	if strings.Contains(metric, "rate(") || strings.Contains(metric, "irate(") {
-		step := int64(15) // 15 second default step
+	// Add step parameter: use custom step if provided, otherwise auto-detect for rate/irate
+	var step int64
+	if customStep > 0 {
+		// User provided explicit step
+		step = customStep
+		queryURL += fmt.Sprintf("&step=%d", step)
+	} else if strings.Contains(metric, "rate(") || strings.Contains(metric, "irate(") {
+		// Auto-add step for rate/irate queries
+		step = int64(15) // 15 second default step
 		// Adjust step based on time range
 		timeRange := endTs - startTs
 		if timeRange > 3600 {
@@ -688,23 +767,12 @@ func parseRelativeTime(s string) (int64, error) {
 	op := s[0] // '+' or '-'
 	durationStr := s[1:]
 
-	// Parse duration
-	var duration time.Duration
-	var err error
-
-	// Custom parsing for simplified format (e.g., "1h", "30m", "2d")
-	if strings.HasSuffix(durationStr, "d") {
-		days, err := strconv.Atoi(strings.TrimSuffix(durationStr, "d"))
-		if err != nil {
-			return 0, fmt.Errorf("invalid duration: %w", err)
-		}
-		duration = time.Duration(days) * 24 * time.Hour
-	} else {
-		duration, err = time.ParseDuration(durationStr)
-		if err != nil {
-			return 0, fmt.Errorf("invalid duration: %w", err)
-		}
+	// Parse duration using parseDuration
+	durationSecs, err := parseDuration(durationStr)
+	if err != nil {
+		return 0, err
 	}
+	duration := time.Duration(durationSecs) * time.Second
 
 	// Apply operator
 	var result time.Time

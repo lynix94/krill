@@ -588,9 +588,18 @@ const dashboardHTML = `<!DOCTYPE html>
                     const start = now - (startHours * 3600);
                     const end = now - (endHours * 3600);
                     
+                    // Calculate appropriate step based on time range
+                    const timeRange = end - start;
+                    let step = 15; // default 15 seconds
+                    if (timeRange > 86400) {
+                        step = 300; // 5 minutes for ranges > 1 day
+                    } else if (timeRange > 3600) {
+                        step = 60; // 1 minute for ranges > 1 hour
+                    }
+                    
                     response = await fetch(
                         '/api/v1/query_range?query=' + encodeURIComponent(metric) + 
-                        '&start=' + start + '&end=' + end
+                        '&start=' + start + '&end=' + end + '&step=' + step
                     );
                     data = await response.json();
                     

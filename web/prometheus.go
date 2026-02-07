@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -190,9 +191,22 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	// Parse query with aggregation support
 	parsed := parsePromQL(query)
 
-	// Check if this is a rate/irate query with step parameter
-	if step > 0 && (parsed.AggFunc == AggRate || parsed.AggFunc == AggIrate) {
-		result := ph.evaluateRateWithStep(parsed, start, end, step)
+	// Check if this is a range vector function with step parameter
+	isRangeVectorFunc := parsed.AggFunc == AggRate || parsed.AggFunc == AggIrate ||
+		parsed.AggFunc == AggSumOverTime || parsed.AggFunc == AggAvgOverTime ||
+		parsed.AggFunc == AggMinOverTime || parsed.AggFunc == AggMaxOverTime ||
+		parsed.AggFunc == AggCountOverTime || parsed.AggFunc == AggStddevOverTime ||
+		parsed.AggFunc == AggStdvarOverTime || parsed.AggFunc == AggQuantileOverTime
+	
+	if step > 0 && isRangeVectorFunc {
+		// Validate range vector is specified
+		if parsed.RangeVector <= 0 {
+			ph.sendError(w, http.StatusBadRequest, 
+				fmt.Sprintf("range vector duration required for %s function (e.g., %s(metric[5m]))", 
+					parsed.AggFunc, parsed.AggFunc))
+			return
+		}
+		result := ph.evaluateRangeVectorWithStep(parsed, start, end, step)
 		ph.sendSuccess(w, QueryData{
 			ResultType: "matrix",
 			Result:     result,
@@ -218,6 +232,11 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 			}
 
 			if len(values) > 0 {
+				// Apply step-based downsampling if step is specified
+				if step > 0 {
+					timestamps, values = downsampleByStep(timestamps, values, start, end, step)
+				}
+				
 				valuesArray := make([][]interface{}, len(values))
 				for i := range values {
 					valuesArray[i] = []interface{}{timestamps[i], fmt.Sprintf("%f", values[i])}
@@ -421,9 +440,52 @@ func matchesQuery(metricKey string, queryName string, labelMatchers map[string]s
 	return true
 }
 
-// evaluateRateWithStep evaluates rate/irate at multiple time steps
-func (ph *PrometheusHandler) evaluateRateWithStep(parsed ParsedQuery, start, end, step int64) []QueryResult {
+// downsampleByStep downsamples time series data by selecting values at step intervals
+func downsampleByStep(timestamps []int64, values []float64, start, end, step int64) ([]int64, []float64) {
+	if step <= 0 || len(timestamps) == 0 {
+		return timestamps, values
+	}
+
+	var resultTimestamps []int64
+	var resultValues []float64
+
+	// For each evaluation time (aligned to step intervals)
+	for evalTime := start; evalTime <= end; evalTime += step {
+		// Find the timestamp that is <= evalTime and closest to it
+		// This matches Prometheus behavior for consistent results
+		bestIdx := -1
+		bestTs := int64(0)
+		
+		for i, ts := range timestamps {
+			// Only consider timestamps at or before evalTime
+			if ts <= evalTime {
+				// Pick the closest one (largest timestamp <= evalTime)
+				if bestIdx == -1 || ts > bestTs {
+					bestIdx = i
+					bestTs = ts
+				}
+			}
+		}
+		
+		if bestIdx >= 0 {
+			resultTimestamps = append(resultTimestamps, evalTime)
+			resultValues = append(resultValues, values[bestIdx])
+		}
+	}
+
+	return resultTimestamps, resultValues
+}
+
+// evaluateRangeVectorWithStep evaluates range vector functions (rate/irate/*_over_time) at multiple time steps
+func (ph *PrometheusHandler) evaluateRangeVectorWithStep(parsed ParsedQuery, start, end, step int64) []QueryResult {
 	var results []QueryResult
+
+	// Validate that range vector is specified for range vector functions
+	if parsed.RangeVector <= 0 {
+		// Return empty results - this will show "No data found"
+		// A better error message could be added at the API level
+		return results
+	}
 
 	// Get all matching metrics
 	metrics, err := ph.tsdb.GetMetrics()
@@ -441,7 +503,7 @@ func (ph *PrometheusHandler) evaluateRateWithStep(parsed ParsedQuery, start, end
 		parsedName, parsedTags := parseMetricKey(metric)
 		parsedTags["__name__"] = parsedName
 
-		// Calculate rate/irate at each evaluation time
+		// Calculate function at each evaluation time
 		var evaluationTimes []int64
 		for evalTime := start; evalTime <= end; evalTime += step {
 			evaluationTimes = append(evaluationTimes, evalTime)
@@ -459,47 +521,118 @@ func (ph *PrometheusHandler) evaluateRateWithStep(parsed ParsedQuery, start, end
 			rangeEnd := evalTime
 
 			timestamps, values, err := ph.tsdb.Get(metric, rangeStart, rangeEnd)
-			if err != nil || len(values) < 2 {
-				continue // Need at least 2 points
+			if err != nil || len(values) == 0 {
+				continue
 			}
 
-			var rateValue float64
+			var resultValue float64
+			hasValue := false
 
-			if parsed.AggFunc == AggRate {
-				// rate: use first and last points
-				firstVal := values[0]
-				lastVal := values[len(values)-1]
-				firstTs := timestamps[0]
-				lastTs := timestamps[len(timestamps)-1]
+			switch parsed.AggFunc {
+			case AggRate:
+				if len(values) >= 2 {
+					// rate: use first and last points
+					firstVal := values[0]
+					lastVal := values[len(values)-1]
+					firstTs := timestamps[0]
+					lastTs := timestamps[len(timestamps)-1]
 
-				timeDiff := float64(lastTs - firstTs)
-				if timeDiff > 0 {
-					valueDiff := lastVal - firstVal
-					if valueDiff < 0 {
-						// Counter reset
-						valueDiff = lastVal
+					timeDiff := float64(lastTs - firstTs)
+					if timeDiff > 0 {
+						valueDiff := lastVal - firstVal
+						if valueDiff < 0 {
+							// Counter reset
+							valueDiff = lastVal
+						}
+						resultValue = valueDiff / timeDiff
+						hasValue = true
 					}
-					rateValue = valueDiff / timeDiff
 				}
-			} else if parsed.AggFunc == AggIrate {
-				// irate: use last two points
-				prevVal := values[len(values)-2]
-				lastVal := values[len(values)-1]
-				prevTs := timestamps[len(timestamps)-2]
-				lastTs := timestamps[len(timestamps)-1]
+			case AggIrate:
+				if len(values) >= 2 {
+					// irate: use last two points
+					prevVal := values[len(values)-2]
+					lastVal := values[len(values)-1]
+					prevTs := timestamps[len(timestamps)-2]
+					lastTs := timestamps[len(timestamps)-1]
 
-				timeDiff := float64(lastTs - prevTs)
-				if timeDiff > 0 {
-					valueDiff := lastVal - prevVal
-					if valueDiff < 0 {
-						// Counter reset
-						valueDiff = lastVal
+					timeDiff := float64(lastTs - prevTs)
+					if timeDiff > 0 {
+						valueDiff := lastVal - prevVal
+						if valueDiff < 0 {
+							// Counter reset
+							valueDiff = lastVal
+						}
+						resultValue = valueDiff / timeDiff
+						hasValue = true
 					}
-					rateValue = valueDiff / timeDiff
+				}
+			case AggMaxOverTime:
+				// Find maximum value in the range
+				resultValue = values[0]
+				for _, v := range values {
+					if v > resultValue {
+						resultValue = v
+					}
+				}
+				hasValue = true
+			case AggMinOverTime:
+				// Find minimum value in the range
+				resultValue = values[0]
+				for _, v := range values {
+					if v < resultValue {
+						resultValue = v
+					}
+				}
+				hasValue = true
+			case AggAvgOverTime:
+				// Calculate average
+				sum := 0.0
+				for _, v := range values {
+					sum += v
+				}
+				resultValue = sum / float64(len(values))
+				hasValue = true
+			case AggSumOverTime:
+				// Calculate sum
+				sum := 0.0
+				for _, v := range values {
+					sum += v
+				}
+				resultValue = sum
+				hasValue = true
+			case AggCountOverTime:
+				// Count data points
+				resultValue = float64(len(values))
+				hasValue = true
+			case AggStddevOverTime, AggStdvarOverTime:
+				// Calculate standard deviation / variance
+				if len(values) > 0 {
+					sum := 0.0
+					for _, v := range values {
+						sum += v
+					}
+					mean := sum / float64(len(values))
+					
+					variance := 0.0
+					for _, v := range values {
+						diff := v - mean
+						variance += diff * diff
+					}
+					variance /= float64(len(values))
+					
+					if parsed.AggFunc == AggStddevOverTime {
+						resultValue = math.Sqrt(variance)
+					} else {
+						resultValue = variance
+					}
+					hasValue = true
 				}
 			}
 
-			valuesArray = append(valuesArray, []interface{}{evalTime, fmt.Sprintf("%f", rateValue)})
+			if hasValue {
+				valuesArray = append(valuesArray, []interface{}{evalTime, fmt.Sprintf("%f", resultValue)})
+			}
 		}
 
 		if len(valuesArray) > 0 {
