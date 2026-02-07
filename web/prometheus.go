@@ -151,8 +151,10 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	// Parse start and end times
 	startParam := r.URL.Query().Get("start")
 	endParam := r.URL.Query().Get("end")
+	stepParam := r.URL.Query().Get("step")
 
 	var start, end int64
+	var step int64 = 0 // 0 means no step (return all data)
 	var err error
 
 	if startParam != "" {
@@ -173,8 +175,30 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 		end = time.Now().Unix()
 	}
 
+	if stepParam != "" {
+		step, err = strconv.ParseInt(stepParam, 10, 64)
+		if err != nil {
+			ph.sendError(w, http.StatusBadRequest, "invalid step parameter")
+			return
+		}
+		if step <= 0 {
+			ph.sendError(w, http.StatusBadRequest, "step must be positive")
+			return
+		}
+	}
+
 	// Parse query with aggregation support
 	parsed := parsePromQL(query)
+
+	// Check if this is a rate/irate query with step parameter
+	if step > 0 && (parsed.AggFunc == AggRate || parsed.AggFunc == AggIrate) {
+		result := ph.evaluateRateWithStep(parsed, start, end, step)
+		ph.sendSuccess(w, QueryData{
+			ResultType: "matrix",
+			Result:     result,
+		})
+		return
+	}
 
 	// Get all metrics and filter by label matchers
 	metrics, err := ph.tsdb.GetMetrics()
@@ -396,6 +420,99 @@ func matchesQuery(metricKey string, queryName string, labelMatchers map[string]s
 	
 	return true
 }
+
+// evaluateRateWithStep evaluates rate/irate at multiple time steps
+func (ph *PrometheusHandler) evaluateRateWithStep(parsed ParsedQuery, start, end, step int64) []QueryResult {
+	var results []QueryResult
+
+	// Get all matching metrics
+	metrics, err := ph.tsdb.GetMetrics()
+	if err != nil {
+		return results
+	}
+
+	// Filter metrics by name and labels
+	for _, metric := range metrics {
+		if !matchesQuery(metric, parsed.MetricName, parsed.LabelMatchers) {
+			continue
+		}
+
+		// Parse metric labels
+		parsedName, parsedTags := parseMetricKey(metric)
+		parsedTags["__name__"] = parsedName
+
+		// Calculate rate/irate at each evaluation time
+		var evaluationTimes []int64
+		for evalTime := start; evalTime <= end; evalTime += step {
+			evaluationTimes = append(evaluationTimes, evalTime)
+		}
+		// Always include end time if not already included
+		if len(evaluationTimes) == 0 || evaluationTimes[len(evaluationTimes)-1] != end {
+			evaluationTimes = append(evaluationTimes, end)
+		}
+
+		var valuesArray [][]interface{}
+		
+		for _, evalTime := range evaluationTimes {
+			// Get data in the range vector window before this evaluation time
+			rangeStart := evalTime - parsed.RangeVector
+			rangeEnd := evalTime
+
+			timestamps, values, err := ph.tsdb.Get(metric, rangeStart, rangeEnd)
+			if err != nil || len(values) < 2 {
+				continue // Need at least 2 points
+			}
+
+			var rateValue float64
+
+			if parsed.AggFunc == AggRate {
+				// rate: use first and last points
+				firstVal := values[0]
+				lastVal := values[len(values)-1]
+				firstTs := timestamps[0]
+				lastTs := timestamps[len(timestamps)-1]
+
+				timeDiff := float64(lastTs - firstTs)
+				if timeDiff > 0 {
+					valueDiff := lastVal - firstVal
+					if valueDiff < 0 {
+						// Counter reset
+						valueDiff = lastVal
+					}
+					rateValue = valueDiff / timeDiff
+				}
+			} else if parsed.AggFunc == AggIrate {
+				// irate: use last two points
+				prevVal := values[len(values)-2]
+				lastVal := values[len(values)-1]
+				prevTs := timestamps[len(timestamps)-2]
+				lastTs := timestamps[len(timestamps)-1]
+
+				timeDiff := float64(lastTs - prevTs)
+				if timeDiff > 0 {
+					valueDiff := lastVal - prevVal
+					if valueDiff < 0 {
+						// Counter reset
+						valueDiff = lastVal
+					}
+					rateValue = valueDiff / timeDiff
+				}
+			}
+
+			valuesArray = append(valuesArray, []interface{}{evalTime, fmt.Sprintf("%f", rateValue)})
+		}
+
+		if len(valuesArray) > 0 {
+			results = append(results, QueryResult{
+				Metric: parsedTags,
+				Values: valuesArray,
+			})
+		}
+	}
+
+	return results
+}
+
 
 func (ph *PrometheusHandler) sendSuccess(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")

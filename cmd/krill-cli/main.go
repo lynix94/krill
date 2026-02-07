@@ -168,6 +168,8 @@ func runInteractive() error {
 		Stdout:                 os.Stdout,
 		Stderr:                 os.Stderr,
 		DisableAutoSaveHistory: false,
+		EnableMask:             false,
+		UniqueEditLine:         true,
 		FuncFilterInputRune: func(r rune) (rune, bool) {
 			return r, true
 		},
@@ -182,11 +184,16 @@ func runInteractive() error {
 	fmt.Println("Type 'help' for usage, 'exit' to quit")
 	fmt.Println()
 	fmt.Println("Keyboard shortcuts:")
-	fmt.Println("  Home / Ctrl+A  - Move to beginning of line")
-	fmt.Println("  End / Ctrl+E   - Move to end of line")
+	fmt.Println("  Ctrl+A         - Move to beginning of line (alternative to Home)")
+	fmt.Println("  Ctrl+E         - Move to end of line (alternative to End)")
+	fmt.Println("  Ctrl+B / ←     - Move backward one character")
+	fmt.Println("  Ctrl+F / →     - Move forward one character")
 	fmt.Println("  Ctrl+W         - Delete word before cursor")
-	fmt.Println("  Ctrl+U         - Clear line")
-	fmt.Println("  Up/Down        - Navigate command history")
+	fmt.Println("  Ctrl+U         - Clear line before cursor")
+	fmt.Println("  Ctrl+K         - Clear line after cursor")
+	fmt.Println("  Up/Down or ↑/↓ - Navigate command history")
+	fmt.Println("  Ctrl+C         - Cancel current input")
+	fmt.Println("  Ctrl+D         - Exit (on empty line)")
 	fmt.Println()
 
 	for {
@@ -219,6 +226,9 @@ func runInteractive() error {
 		if args[0] == "exit" || args[0] == "quit" {
 			break
 		}
+
+		// Echo the command being executed
+		fmt.Printf("krill> %s\n", line)
 
 		// Execute command
 		if err := executeCommand(args); err != nil {
@@ -441,8 +451,25 @@ func handleQueryRange(args []string) error {
 	}
 
 	// Build GET request URL with query parameters
+	// Add default step for rate/irate queries
 	queryURL := fmt.Sprintf("%s/api/v1/query_range?query=%s&start=%d&end=%d",
 		serverURL, url.QueryEscape(metric), startTs, endTs)
+	
+	// Auto-add step for rate/irate queries (15 second intervals)
+	if strings.Contains(metric, "rate(") || strings.Contains(metric, "irate(") {
+		step := int64(15) // 15 second default step
+		// Adjust step based on time range
+		timeRange := endTs - startTs
+		if timeRange > 3600 {
+			// For ranges > 1 hour, use 1 minute step
+			step = 60
+		}
+		if timeRange > 86400 {
+			// For ranges > 1 day, use 5 minute step
+			step = 300
+		}
+		queryURL += fmt.Sprintf("&step=%d", step)
+	}
 
 	resp, err := http.Get(queryURL)
 	if err != nil {
@@ -487,39 +514,64 @@ func handleQueryRange(args []string) error {
 			fmt.Printf("%s=%s", k, v)
 			first = false
 		}
-		fmt.Printf("\nData Points: %d\n\n", len(series.Values))
+		
+		// Check if this is a range query (multiple values) or instant query (single value)
+		if len(series.Values) > 0 {
+			// Multiple values (range query)
+			fmt.Printf("\nData Points: %d\n\n", len(series.Values))
 
-		if len(series.Values) == 0 {
-			fmt.Println("No data points found")
-			continue
-		}
+			fmt.Println("Timestamp                | Value")
+			fmt.Println("-------------------------|----------------")
+			for _, point := range series.Values {
+				if len(point) >= 2 {
+					// Parse timestamp (can be int64 or float64)
+					var ts int64
+					switch v := point[0].(type) {
+					case float64:
+						ts = int64(v)
+					case int64:
+						ts = v
+					}
 
-		fmt.Println("Timestamp                | Value")
-		fmt.Println("-------------------------|----------------")
-		for _, point := range series.Values {
-			if len(point) >= 2 {
-				// Parse timestamp (can be int64 or float64)
-				var ts int64
-				switch v := point[0].(type) {
-				case float64:
-					ts = int64(v)
-				case int64:
-					ts = v
+					// Parse value (string)
+					valueStr, ok := point[1].(string)
+					if !ok {
+						continue
+					}
+					value, err := strconv.ParseFloat(valueStr, 64)
+					if err != nil {
+						continue
+					}
+
+					timestamp := time.Unix(ts, 0)
+					fmt.Printf("%s | %.6f\n", timestamp.Format("2006-01-02 15:04:05"), value)
 				}
-
-				// Parse value (string)
-				valueStr, ok := point[1].(string)
-				if !ok {
-					continue
-				}
-				value, err := strconv.ParseFloat(valueStr, 64)
-				if err != nil {
-					continue
-				}
-
-				timestamp := time.Unix(ts, 0)
-				fmt.Printf("%s | %.6f\n", timestamp.Format("2006-01-02 15:04:05"), value)
 			}
+		} else if len(series.Value) >= 2 {
+			// Single value (instant query result)
+			fmt.Printf("\nData Points: 1\n\n")
+			
+			fmt.Println("Timestamp                | Value")
+			fmt.Println("-------------------------|----------------")
+			
+			var ts int64
+			switch v := series.Value[0].(type) {
+			case float64:
+				ts = int64(v)
+			case int64:
+				ts = v
+			}
+			
+			valueStr, ok := series.Value[1].(string)
+			if ok {
+				value, err := strconv.ParseFloat(valueStr, 64)
+				if err == nil {
+					timestamp := time.Unix(ts, 0)
+					fmt.Printf("%s | %.6f\n", timestamp.Format("2006-01-02 15:04:05"), value)
+				}
+			}
+		} else {
+			fmt.Println("\nNo data points found")
 		}
 		fmt.Println()
 	}

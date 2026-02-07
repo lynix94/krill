@@ -24,6 +24,8 @@ const (
 	AggTopk        AggregationFunc = "topk"
 	AggQuantile    AggregationFunc = "quantile"
 	// Range vector functions
+	AggRate             AggregationFunc = "rate"
+	AggIrate            AggregationFunc = "irate"
 	AggSumOverTime      AggregationFunc = "sum_over_time"
 	AggAvgOverTime      AggregationFunc = "avg_over_time"
 	AggMinOverTime      AggregationFunc = "min_over_time"
@@ -64,6 +66,7 @@ func parsePromQL(query string) ParsedQuery {
 		AggSum, AggMin, AggMax, AggAvg, AggStddev, AggStdvar,
 		AggCount, AggCountValues, AggBottomk, AggTopk, AggQuantile,
 		// Range vector functions
+		AggRate, AggIrate,
 		AggSumOverTime, AggAvgOverTime, AggMinOverTime, AggMaxOverTime,
 		AggCountOverTime, AggStddevOverTime, AggStdvarOverTime, AggQuantileOverTime,
 	} {
@@ -195,6 +198,18 @@ func parseDuration(s string) int64 {
 func applyAggregation(parsed ParsedQuery, results []QueryResult) []QueryResult {
 	if parsed.AggFunc == "" {
 		return results // No aggregation
+	}
+
+	// rate() and irate() are not aggregation functions - they transform each series individually
+	if parsed.AggFunc == AggRate || parsed.AggFunc == AggIrate {
+		var transformedResults []QueryResult
+		for _, r := range results {
+			transformedResult := applyRateToSeries(r, parsed.AggFunc)
+			if transformedResult.Value != nil || transformedResult.Values != nil {
+				transformedResults = append(transformedResults, transformedResult)
+			}
+		}
+		return transformedResults
 	}
 
 	// Group results if needed
@@ -1108,4 +1123,210 @@ func aggregateQuantileOverTime(results []QueryResult, quantile float64) QueryRes
 	}
 
 	return result
+}
+
+// applyRateToSeries applies rate or irate to a single series
+func applyRateToSeries(series QueryResult, funcType AggregationFunc) QueryResult {
+	result := QueryResult{Metric: series.Metric}
+
+	// Need at least 2 data points
+	if len(series.Values) < 2 {
+		return result
+	}
+
+	if funcType == AggRate {
+		// rate: use first and last points
+		firstPoint := series.Values[0]
+		lastPoint := series.Values[len(series.Values)-1]
+
+		if len(firstPoint) < 2 || len(lastPoint) < 2 {
+			return result
+		}
+
+		firstTs, _ := firstPoint[0].(int64)
+		firstValStr, _ := firstPoint[1].(string)
+		firstVal, _ := strconv.ParseFloat(firstValStr, 64)
+
+		lastTs, _ := lastPoint[0].(int64)
+		lastValStr, _ := lastPoint[1].(string)
+		lastVal, _ := strconv.ParseFloat(lastValStr, 64)
+
+		// Calculate time difference in seconds
+		timeDiff := float64(lastTs - firstTs)
+		if timeDiff <= 0 {
+			return result
+		}
+
+		// Calculate rate (handling counter resets)
+		valueDiff := lastVal - firstVal
+		if valueDiff < 0 {
+			// Counter reset detected, assume it started from 0
+			valueDiff = lastVal
+		}
+
+		rate := valueDiff / timeDiff
+		result.Value = []interface{}{lastTs, fmt.Sprintf("%f", rate)}
+		
+	} else if funcType == AggIrate {
+		// irate: use last two points
+		prevPoint := series.Values[len(series.Values)-2]
+		lastPoint := series.Values[len(series.Values)-1]
+
+		if len(prevPoint) < 2 || len(lastPoint) < 2 {
+			return result
+		}
+
+		prevTs, _ := prevPoint[0].(int64)
+		prevValStr, _ := prevPoint[1].(string)
+		prevVal, _ := strconv.ParseFloat(prevValStr, 64)
+
+		lastTs, _ := lastPoint[0].(int64)
+		lastValStr, _ := lastPoint[1].(string)
+		lastVal, _ := strconv.ParseFloat(lastValStr, 64)
+
+		// Calculate time difference in seconds
+		timeDiff := float64(lastTs - prevTs)
+		if timeDiff <= 0 {
+			return result
+		}
+
+		// Calculate instantaneous rate (handling counter resets)
+		valueDiff := lastVal - prevVal
+		if valueDiff < 0 {
+			// Counter reset detected, assume it started from 0
+			valueDiff = lastVal
+		}
+
+		irate := valueDiff / timeDiff
+		result.Value = []interface{}{lastTs, fmt.Sprintf("%f", irate)}
+	}
+
+	return result
+}
+
+// aggregateRate calculates per-second average rate of increase over the time range
+// This is used for counter metrics to calculate the rate of change
+// Deprecated: Use applyRateToSeries instead
+func aggregateRate(results []QueryResult) QueryResult {
+	if len(results) == 0 {
+		return QueryResult{Metric: make(map[string]string)}
+	}
+
+	// For Prometheus compatibility, rate() should be applied per-series
+	// If there are multiple series, we need to return all of them
+	// But since we return a single QueryResult, we handle the first series only
+	// This matches instant query behavior where rate() gives a single value per series
+	
+	var allResults []QueryResult
+	
+	for _, r := range results {
+		// Check if this is a range query with multiple values
+		if len(r.Values) >= 2 {
+			// Get first and last points
+			firstPoint := r.Values[0]
+			lastPoint := r.Values[len(r.Values)-1]
+
+			if len(firstPoint) < 2 || len(lastPoint) < 2 {
+				continue
+			}
+
+			firstTs, _ := firstPoint[0].(int64)
+			firstValStr, _ := firstPoint[1].(string)
+			firstVal, _ := strconv.ParseFloat(firstValStr, 64)
+
+			lastTs, _ := lastPoint[0].(int64)
+			lastValStr, _ := lastPoint[1].(string)
+			lastVal, _ := strconv.ParseFloat(lastValStr, 64)
+
+			// Calculate time difference in seconds
+			timeDiff := float64(lastTs - firstTs)
+			if timeDiff <= 0 {
+				continue
+			}
+
+			// Calculate rate (handling counter resets)
+			valueDiff := lastVal - firstVal
+			if valueDiff < 0 {
+				// Counter reset detected, assume it started from 0
+				valueDiff = lastVal
+			}
+
+			rate := valueDiff / timeDiff
+
+			seriesResult := QueryResult{
+				Metric: r.Metric,
+				Value:  []interface{}{lastTs, fmt.Sprintf("%f", rate)},
+			}
+			allResults = append(allResults, seriesResult)
+		}
+	}
+
+	// Return first result for backward compatibility
+	// TODO: Support multiple series properly
+	if len(allResults) > 0 {
+		return allResults[0]
+	}
+	
+	return QueryResult{Metric: make(map[string]string)}
+}
+
+// aggregateIrate calculates instantaneous per-second rate of increase
+// Uses only the last two data points for immediate rate
+func aggregateIrate(results []QueryResult) QueryResult {
+	if len(results) == 0 {
+		return QueryResult{Metric: make(map[string]string)}
+	}
+
+	var allResults []QueryResult
+	
+	// Calculate irate for each series
+	for _, r := range results {
+		// Check if this is a range query with multiple values
+		if len(r.Values) >= 2 {
+			// Get last two points
+			prevPoint := r.Values[len(r.Values)-2]
+			lastPoint := r.Values[len(r.Values)-1]
+
+			if len(prevPoint) < 2 || len(lastPoint) < 2 {
+				continue
+			}
+
+			prevTs, _ := prevPoint[0].(int64)
+			prevValStr, _ := prevPoint[1].(string)
+			prevVal, _ := strconv.ParseFloat(prevValStr, 64)
+
+			lastTs, _ := lastPoint[0].(int64)
+			lastValStr, _ := lastPoint[1].(string)
+			lastVal, _ := strconv.ParseFloat(lastValStr, 64)
+
+			// Calculate time difference in seconds
+			timeDiff := float64(lastTs - prevTs)
+			if timeDiff <= 0 {
+				continue
+			}
+
+			// Calculate instantaneous rate (handling counter resets)
+			valueDiff := lastVal - prevVal
+			if valueDiff < 0 {
+				// Counter reset detected, assume it started from 0
+				valueDiff = lastVal
+			}
+
+			irate := valueDiff / timeDiff
+
+			seriesResult := QueryResult{
+				Metric: r.Metric,
+				Value:  []interface{}{lastTs, fmt.Sprintf("%f", irate)},
+			}
+			allResults = append(allResults, seriesResult)
+		}
+	}
+
+	// Return first result for backward compatibility
+	// TODO: Support multiple series properly
+	if len(allResults) > 0 {
+		return allResults[0]
+	}
+	
+	return QueryResult{Metric: make(map[string]string)}
 }
