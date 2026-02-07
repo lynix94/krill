@@ -22,6 +22,7 @@ const usage = `krill-cli - Command line tool for Krill TSDB
 Usage:
   krill-cli -server <url>                                              # Interactive mode
   krill-cli -server <url> query_range <metric> <start> <end> [step]   # Single command
+  krill-cli -server <url> query_range <metric> <start> <end> [step] | <function>  # With pipeline
   krill-cli -server <url> put <timestamp> <metric> <value> [...]
 
 Modes:
@@ -34,14 +35,21 @@ Modes:
 
 Commands:
   query_range  Query metric data within a time range
-               Format: query_range <metric> <start> <end> [step]
+               Format: query_range <metric> <start> <end> [step] [| <function>]
                - step: optional sampling interval in seconds (default: auto)
+               - pipeline: | <function_name> for server-side processing
                Alias: query
   put          Insert one or more metric data points
                Alias: write
   metrics      List all metrics (optionally filtered by regex)
   help         Show this help message
   exit         Exit interactive mode (interactive only)
+
+Pipeline Functions:
+  Use | followed by function name to process results server-side
+  - pass         Return data unchanged (useful for testing)
+  
+  Example: query test_metric 0 9999999999 | pass
 
 Options:
   -server string
@@ -57,6 +65,7 @@ Examples:
   krill-cli -server http://localhost:9090
   krill> put now cpu.usage 45.5
   krill> query cpu.usage 0 9999999999
+  krill> query cpu.usage 0 9999999999 | pass
   krill> metrics
   krill> metrics network
   krill> exit
@@ -64,6 +73,7 @@ Examples:
   # Single commands
   krill-cli -server http://localhost:9090 query_range cpu.usage 0 9999999999
   krill-cli -server http://localhost:9090 query_range rate(cpu.usage[1m]) now-1h now 30
+  krill-cli -server http://localhost:9090 query test_metric now-1h now 60 '|' pass
   krill-cli -server http://localhost:9090 put now cpu.usage 45.5
   krill-cli -server http://localhost:9090 metrics
   krill-cli -server http://localhost:9090 metrics "^http"
@@ -75,9 +85,30 @@ Examples:
 
   # Relative time
   krill-cli put now-1h cpu.load 1.5
+  
+  # Pipeline processing (server-side)
+  krill-cli query test_metric now-1h now | pass
 `
 
 var serverURL string
+
+type KrillQLRequest struct {
+	Queries []KrillQLQuery `json:"queries"`
+}
+
+type FunctionStage struct {
+	Name string `json:"name"`
+	Type string `json:"type,omitempty"`
+	Code string `json:"code,omitempty"`
+}
+
+type KrillQLQuery struct {
+	Query     string           `json:"query"`
+	Start     int64            `json:"start"`
+	End       int64            `json:"end"`
+	Step      int64            `json:"step,omitempty"`
+	Functions []FunctionStage  `json:"functions,omitempty"`
+}
 
 type QueryRangeRequest struct {
 	Metric  string `json:"metric"`
@@ -216,6 +247,7 @@ func runInteractive() error {
 
 		line = strings.TrimSpace(line)
 		if line == "" {
+			fmt.Println(rl.Config.Prompt)
 			continue
 		}
 
@@ -230,8 +262,8 @@ func runInteractive() error {
 			break
 		}
 
-		// Echo the command being executed
-		fmt.Printf("krill> %s\n", line)
+		// Echo the command before executing
+		fmt.Printf("%s%s\n", rl.Config.Prompt, line)
 
 		// Execute command
 		if err := executeCommand(args); err != nil {
@@ -437,16 +469,45 @@ func handleQueryRange(args []string) error {
 		return handleInstantQuery(metric)
 	}
 
-	// Parse arguments: <metric> <start> <end> [step]
+	// Parse arguments: <metric> <start> <end> [step] [| function]
 	// Expected formats:
 	// - 1 arg: metric (instant query)
 	// - 3 args: metric start end
 	// - 4 args: metric start end step OR "metric query" start end
-	// - 5+ args: error or complex metric query
+	// - pipeline: metric start end step | function_name
 	var possibleStep string
 	var timestampArgs []string
+	var pipelineFunctions []FunctionStage
 	
-	// Reject too many arguments (more than 5 suggests user error)
+	// Check for pipeline (|)
+	pipeIndex := -1
+	for i, arg := range args {
+		if arg == "|" {
+			pipeIndex = i
+			break
+		}
+	}
+	
+	// If pipeline found, parse function names
+	if pipeIndex >= 0 {
+		if pipeIndex+1 < len(args) {
+			// Each arg after | is a function name, skip "|" separators
+			for _, funcName := range args[pipeIndex+1:] {
+				funcName = strings.TrimSpace(funcName)
+				if funcName != "" && funcName != "|" {
+					// Determine function type: assume "internal" for known functions
+					funcType := "internal"
+					pipelineFunctions = append(pipelineFunctions, FunctionStage{
+						Name: funcName,
+						Type: funcType,
+					})
+				}
+			}
+		}
+		args = args[:pipeIndex] // Trim to before |
+	}
+	
+	// Reject too many arguments (more than 5 for query part)
 	if len(args) > 5 {
 		return fmt.Errorf("too many arguments (max 5: metric, start, end, step, and possibly metric parts)")
 	}
@@ -524,16 +585,14 @@ func handleQueryRange(args []string) error {
 		}
 	}
 
-	// Build GET request URL with query parameters
-	queryURL := fmt.Sprintf("%s/api/v1/query_range?query=%s&start=%d&end=%d",
-		serverURL, url.QueryEscape(metric), startTs, endTs)
+	// Build JSON request for /api/v1/krillql endpoint
+	apiURL := fmt.Sprintf("%s/api/v1/krillql", serverURL)
 	
-	// Add step parameter: use custom step if provided, otherwise auto-detect for rate/irate
+	// Determine step parameter: use custom step if provided, otherwise auto-detect for rate/irate
 	var step int64
 	if customStep > 0 {
 		// User provided explicit step
 		step = customStep
-		queryURL += fmt.Sprintf("&step=%d", step)
 	} else if strings.Contains(metric, "rate(") || strings.Contains(metric, "irate(") {
 		// Auto-add step for rate/irate queries
 		step = int64(15) // 15 second default step
@@ -547,10 +606,25 @@ func handleQueryRange(args []string) error {
 			// For ranges > 1 day, use 5 minute step
 			step = 300
 		}
-		queryURL += fmt.Sprintf("&step=%d", step)
 	}
-
-	resp, err := http.Get(queryURL)
+	
+	// Prepare JSON request
+	reqBody := KrillQLRequest{
+		Queries: []KrillQLQuery{{
+			Query:     metric,
+			Start:     startTs,
+			End:       endTs,
+			Step:      step,
+			Functions: pipelineFunctions,
+		}},
+	}
+	
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+	
+	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to query server: %w", err)
 	}
@@ -569,6 +643,18 @@ func handleQueryRange(args []string) error {
 	if result.Status != "success" {
 		return fmt.Errorf("server returned error status")
 	}
+
+	// Print the query that was executed
+	fmt.Printf("Query: %s\n", metric)
+	if startTs > 0 && endTs > 0 {
+		fmt.Printf("Time Range: %s to %s", formatTimestamp(startTs), formatTimestamp(endTs))
+		if step > 0 {
+			fmt.Printf(" (step: %ds)\n", step)
+		} else {
+			fmt.Println()
+		}
+	}
+	fmt.Println()
 
 	if len(result.Data.Result) == 0 {
 		fmt.Println("No data found")
@@ -897,4 +983,10 @@ func matchesLabelFilters(metric string, filters map[string]string) bool {
 	}
 	
 	return true
+}
+
+// formatTimestamp formats a Unix timestamp for display
+func formatTimestamp(ts int64) string {
+	t := time.Unix(ts, 0)
+	return t.Format("2006-01-02 15:04:05")
 }

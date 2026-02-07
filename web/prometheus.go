@@ -34,15 +34,43 @@ type PrometheusResponse struct {
 
 // QueryResult represents a single time series result
 type QueryResult struct {
-	Metric map[string]string `json:"metric"`
-	Values [][]interface{}   `json:"values,omitempty"`
-	Value  []interface{}     `json:"value,omitempty"`
+	Metric map[string]string `json:"metric" msgpack:"metric"`
+	Values [][]interface{}   `json:"values,omitempty" msgpack:"values,omitempty"`
+	Value  []interface{}     `json:"value,omitempty" msgpack:"value,omitempty"`
 }
 
 // QueryData represents the data portion of a query response
 type QueryData struct {
-	ResultType string        `json:"resultType"`
-	Result     []QueryResult `json:"result"`
+	ResultType string        `json:"resultType" msgpack:"resultType"`
+	Result     []QueryResult `json:"result" msgpack:"result"`
+}
+
+// FunctionStage represents a function to apply in a pipeline
+type FunctionStage struct {
+	Name string `json:"name"`
+	Type string `json:"type,omitempty"`
+	Code string `json:"code,omitempty"`
+}
+
+// KrillQLQuery represents a single stage in the KrillQL pipeline
+// Can be either a query stage or a function stage
+type KrillQLQuery struct {
+	// Query stage fields
+	Query     string           `json:"query,omitempty"`
+	Start     int64            `json:"start,omitempty"`
+	End       int64            `json:"end,omitempty"`
+	Step      int64            `json:"step,omitempty"`
+	Functions []FunctionStage  `json:"functions,omitempty"`
+	
+	// Function stage fields (for backwards compatibility)
+	Function string `json:"function,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Code     string `json:"code,omitempty"`
+}
+
+// KrillQLRequest represents a JSON request for /api/v1/krillql
+type KrillQLRequest struct {
+	Queries []KrillQLQuery `json:"queries"`
 }
 
 // HandleQuery handles instant queries: GET /api/v1/query
@@ -136,23 +164,38 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// HandleQueryRange handles range queries: GET /api/v1/query_range
+// HandleQueryRange handles range queries: GET or POST /api/v1/query_range
 func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	query := r.URL.Query().Get("query")
+	var query, startParam, endParam, stepParam string
+	
+	// Parse parameters based on request method
+	if r.Method == http.MethodPost {
+		// Parse form data from POST request
+		if err := r.ParseForm(); err != nil {
+			ph.sendError(w, http.StatusBadRequest, "failed to parse form data")
+			return
+		}
+		query = r.FormValue("query")
+		startParam = r.FormValue("start")
+		endParam = r.FormValue("end")
+		stepParam = r.FormValue("step")
+	} else {
+		// Parse query parameters from GET request
+		query = r.URL.Query().Get("query")
+		startParam = r.URL.Query().Get("start")
+		endParam = r.URL.Query().Get("end")
+		stepParam = r.URL.Query().Get("step")
+	}
+
 	if query == "" {
 		ph.sendError(w, http.StatusBadRequest, "query parameter is required")
 		return
 	}
-
-	// Parse start and end times
-	startParam := r.URL.Query().Get("start")
-	endParam := r.URL.Query().Get("end")
-	stepParam := r.URL.Query().Get("step")
 
 	var start, end int64
 	var step int64 = 0 // 0 means no step (return all data)
@@ -653,6 +696,155 @@ func (ph *PrometheusHandler) sendSuccess(w http.ResponseWriter, data interface{}
 		Status: "success",
 		Data:   data,
 	})
+}
+
+// HandleKrillQL handles JSON-based queries: POST /api/v1/krillql
+// Supports pipeline processing where results flow from one stage to the next
+func (ph *PrometheusHandler) HandleKrillQL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// Parse JSON request body
+	var req KrillQLRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		ph.sendError(w, http.StatusBadRequest, "invalid JSON request: "+err.Error())
+		return
+	}
+	defer r.Body.Close()
+
+	// Validate queries array
+	if len(req.Queries) == 0 {
+		ph.sendError(w, http.StatusBadRequest, "queries array is required and must not be empty")
+		return
+	}
+
+	// First stage must be a query
+	firstStage := req.Queries[0]
+	if firstStage.Query == "" {
+		ph.sendError(w, http.StatusBadRequest, "first stage must be a query (query field required)")
+		return
+	}
+	if firstStage.Start <= 0 || firstStage.End <= 0 {
+		ph.sendError(w, http.StatusBadRequest, "start and end fields are required in first query")
+		return
+	}
+	if firstStage.Start >= firstStage.End {
+		ph.sendError(w, http.StatusBadRequest, "start must be less than end")
+		return
+	}
+
+	// Execute first query stage
+	parsed := parsePromQL(firstStage.Query)
+
+	// Determine if this is a range vector function
+	isRangeVectorFunc := parsed.AggFunc == "rate" || parsed.AggFunc == "irate" ||
+		parsed.AggFunc == "max_over_time" || parsed.AggFunc == "min_over_time" ||
+		parsed.AggFunc == "avg_over_time" || parsed.AggFunc == "sum_over_time" ||
+		parsed.AggFunc == "count_over_time" || parsed.AggFunc == "stddev_over_time" ||
+		parsed.AggFunc == "stdvar_over_time"
+
+	var currentResult QueryData
+
+	// Handle range vector functions with step
+	if firstStage.Step > 0 && isRangeVectorFunc {
+		if parsed.RangeVector <= 0 {
+			ph.sendError(w, http.StatusBadRequest,
+				fmt.Sprintf("range vector duration required for %s function (e.g., %s(metric[5m]))",
+					parsed.AggFunc, parsed.AggFunc))
+			return
+		}
+		result := ph.evaluateRangeVectorWithStep(parsed, firstStage.Start, firstStage.End, firstStage.Step)
+		currentResult = QueryData{
+			ResultType: "matrix",
+			Result:     result,
+		}
+	} else {
+		// Get all metrics and filter by label matchers
+		metrics, err := ph.tsdb.GetMetrics()
+		if err != nil {
+			ph.sendError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		// Filter metrics by name and labels
+		var result []QueryResult
+		for _, metric := range metrics {
+			if matchesQuery(metric, parsed.MetricName, parsed.LabelMatchers) {
+				// Query TSDB for this specific metric
+				timestamps, values, err := ph.tsdb.Get(metric, firstStage.Start, firstStage.End)
+				if err != nil {
+					continue
+				}
+
+				if len(values) > 0 {
+					// Apply step-based downsampling if step is specified
+					if firstStage.Step > 0 {
+						timestamps, values = downsampleByStep(timestamps, values, firstStage.Start, firstStage.End, firstStage.Step)
+					}
+
+					valuesArray := make([][]interface{}, len(values))
+					for i := range values {
+						valuesArray[i] = []interface{}{timestamps[i], fmt.Sprintf("%f", values[i])}
+					}
+					// Parse metric name and tags from stored key
+					parsedName, parsedTags := parseMetricKey(metric)
+					parsedTags["__name__"] = parsedName
+					result = append(result, QueryResult{
+						Metric: parsedTags,
+						Values: valuesArray,
+					})
+				}
+			}
+		}
+
+		currentResult = QueryData{
+			ResultType: "matrix",
+			Result:     result,
+		}
+	}
+
+	// Process functions from first query stage if present
+	if len(firstStage.Functions) > 0 {
+		for i, fn := range firstStage.Functions {
+			// Create a KrillQLQuery from FunctionStage
+			fnStage := KrillQLQuery{
+				Function: fn.Name,
+				Type:     fn.Type,
+				Code:     fn.Code,
+			}
+			
+			result, err := ProcessPipelineFunction(currentResult, fn.Name, fnStage)
+			if err != nil {
+				ph.sendError(w, http.StatusBadRequest, fmt.Sprintf("error in function[%d]: %s", i, err.Error()))
+				return
+			}
+			currentResult = result
+		}
+	}
+
+	// Process remaining stages as pipeline functions
+	for i := 1; i < len(req.Queries); i++ {
+		stage := req.Queries[i]
+		
+		// Must be a function stage
+		if stage.Function == "" {
+			ph.sendError(w, http.StatusBadRequest, fmt.Sprintf("stage %d must specify a function", i))
+			return
+		}
+		
+		// Process function using external function handler
+		result, err := ProcessPipelineFunction(currentResult, stage.Function, stage)
+		if err != nil {
+			ph.sendError(w, http.StatusBadRequest, fmt.Sprintf("error in stage %d: %s", i, err.Error()))
+			return
+		}
+		currentResult = result
+	}
+
+	// Send final result
+	ph.sendSuccess(w, currentResult)
 }
 
 func (ph *PrometheusHandler) sendError(w http.ResponseWriter, statusCode int, message string) {

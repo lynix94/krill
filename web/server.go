@@ -38,6 +38,9 @@ func NewServer(opts ServerOptions) *Server {
 	mux.HandleFunc("/api/v1/write", handler.HandleWrite)
 	mux.HandleFunc("/api/v1/metrics", handler.HandleMetrics)
 	mux.HandleFunc("/api/v1/label/__name__/values", handler.HandleMetrics)
+	
+	// KrillQL API with JSON support for multiple queries
+	mux.HandleFunc("/api/v1/krillql", handler.HandleKrillQL)
 
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
