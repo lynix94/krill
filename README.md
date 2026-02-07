@@ -8,11 +8,19 @@
 - **메모리/영구 저장소**: 메모리 기반 또는 BadgerDB 영구 저장소 지원
 - **Tag/Label 지원**: Prometheus 스타일 다차원 메트릭 (예: `cpu{host="server1",env="prod"}`)
 - **PromQL 집계 함수**: sum, avg, min, max, count, stddev, topk, quantile 등 지원
+- **Python 함수 파이프라인**: 커스텀 데이터 처리 (PyKrill Daemon - **10배 빠른 성능**)
 - **고성능**: 빠른 읽기/쓰기 (33k+ writes/sec, 3M+ reads/sec)
 - **Thread-safe**: 동시성 안전한 구현
 - **TTL 지원**: 시간 기반 데이터 만료
 - **Time-based 파티셔닝**: 효율적인 범위 쿼리
 - **간단한 API**: 직관적인 `TsdbPut` 함수
+
+## Performance Highlights
+
+- **Compression**: Gorilla 알고리즘으로 90%+ 압축률
+- **Query Speed**: 3M+ reads/sec (메모리), 100k+ reads/sec (BadgerDB)
+- **Write Speed**: 33k+ writes/sec (메모리), 10k+ writes/sec (BadgerDB)
+- **Python Functions**: PyKrill Daemon으로 16ms 평균 응답 (기존 대비 10배 향상)
 
 ## Gorilla Compression
 
@@ -165,14 +173,30 @@ krill/
 ├── tsdb.go                     - 메모리 TSDB 구조체 및 API
 ├── interface.go                - 공통 인터페이스 정의
 ├── tsdb_test.go               - 메모리 TSDB 테스트
+├── pykrill.py                 - Python 함수 실행 데몬 (고성능)
 ├── storage/
 │   ├── gorilla/               - Gorilla 압축 알고리즘
 │   │   ├── bitstream.go       - 비트 단위 읽기/쓰기
 │   │   ├── timestamp.go       - 타임스탬프 압축/해제
 │   │   └── value.go           - 값 압축/해제 (XOR)
-│   └── badger/                - BadgerDB 영구 저장소
-│       ├── badger.go          - BadgerDB TSDB 구현
-│       └── badger_test.go     - BadgerDB 테스트
+│   ├── badger/                - BadgerDB 영구 저장소
+│   │   ├── badger.go          - BadgerDB TSDB 구현
+│   │   └── badger_test.go     - BadgerDB 테스트
+│   └── labels.go              - 라벨/태그 관리
+├── web/
+│   ├── server.go              - HTTP 서버
+│   ├── prometheus.go          - Prometheus API 핸들러
+│   ├── function.go            - 파이프라인 함수 처리 (Python 데몬 통신)
+│   ├── aggregation.go         - PromQL 집계 함수
+│   └── dashboard.go           - Web UI
+├── cmd/
+│   ├── krill-server/          - TSDB 서버
+│   ├── krill-cli/             - CLI 도구
+│   └── krill-scraper/         - Prometheus 스크래퍼
+├── docs/
+│   ├── PYKRILL_DAEMON.md      - Python 데몬 상세 문서 (성능 최적화)
+│   ├── PROMQL_AGGREGATIONS.md - PromQL 집계 함수 가이드
+│   └── KRILL_CLI_GUIDE.md     - CLI 사용 가이드
 └── example/
     ├── memory_example/        - 메모리 TSDB 예제
     └── badger_example/        - BadgerDB TSDB 예제

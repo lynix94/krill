@@ -47,9 +47,10 @@ type QueryData struct {
 
 // FunctionStage represents a function to apply in a pipeline
 type FunctionStage struct {
-	Name string `json:"name"`
-	Type string `json:"type,omitempty"`
-	Code string `json:"code,omitempty"`
+	Name   string `json:"name"`
+	Type   string `json:"type,omitempty"`
+	Code   string `json:"code,omitempty"`
+	Module string `json:"module,omitempty"`
 }
 
 // KrillQLQuery represents a single stage in the KrillQL pipeline
@@ -66,6 +67,7 @@ type KrillQLQuery struct {
 	Function string `json:"function,omitempty"`
 	Type     string `json:"type,omitempty"`
 	Code     string `json:"code,omitempty"`
+	Module   string `json:"module,omitempty"`
 }
 
 // KrillQLRequest represents a JSON request for /api/v1/krillql
@@ -813,6 +815,7 @@ func (ph *PrometheusHandler) HandleKrillQL(w http.ResponseWriter, r *http.Reques
 				Function: fn.Name,
 				Type:     fn.Type,
 				Code:     fn.Code,
+				Module:   fn.Module,
 			}
 			
 			result, err := ProcessPipelineFunction(currentResult, fn.Name, fnStage)
