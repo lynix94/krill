@@ -494,6 +494,10 @@ func downsampleByStep(timestamps []int64, values []float64, start, end, step int
 	var resultTimestamps []int64
 	var resultValues []float64
 
+	// Lookback delta: maximum age of a sample to be considered valid
+	// Use 1.1 * step to allow for slight timing variations
+	lookbackDelta := int64(float64(step) * 1.1)
+
 	// For each evaluation time (aligned to step intervals)
 	for evalTime := start; evalTime <= end; evalTime += step {
 		// Find the timestamp that is <= evalTime and closest to it
@@ -512,7 +516,9 @@ func downsampleByStep(timestamps []int64, values []float64, start, end, step int
 			}
 		}
 		
-		if bestIdx >= 0 {
+		// Only include the value if it's within lookback delta
+		// This prevents stale values from being repeated when data is missing
+		if bestIdx >= 0 && (evalTime - bestTs) <= lookbackDelta {
 			resultTimestamps = append(resultTimestamps, evalTime)
 			resultValues = append(resultValues, values[bestIdx])
 		}
