@@ -173,7 +173,9 @@ krill/
 ├── tsdb.go                     - 메모리 TSDB 구조체 및 API
 ├── interface.go                - 공통 인터페이스 정의
 ├── tsdb_test.go               - 메모리 TSDB 테스트
-├── pykrill.py                 - Python 함수 실행 데몬 (고성능)
+├── pykrill/                   - Python 함수 실행 모듈
+│   ├── pykrill.py            - Python 함수 실행 데몬 (고성능)
+│   └── krill_functions.py    - 기본 제공 Python 함수들
 ├── storage/
 │   ├── gorilla/               - Gorilla 압축 알고리즘
 │   │   ├── bitstream.go       - 비트 단위 읽기/쓰기

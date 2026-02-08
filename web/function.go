@@ -166,9 +166,9 @@ func startDaemon() error {
 	// Find pykrill.py in the current directory or parent directory
 	krillPath := ""
 	possiblePaths := []string{
-		"./pykrill.py",
-		"../pykrill.py",
-		"/home/lynix/git/krill/pykrill.py",
+		"./pykrill/pykrill.py",
+		"../pykrill/pykrill.py",
+		"/home/lynix/git/krill/pykrill/pykrill.py",
 	}
 	
 	for _, path := range possiblePaths {
@@ -179,7 +179,7 @@ func startDaemon() error {
 	}
 	
 	if krillPath == "" {
-		return fmt.Errorf("pykrill.py not found")
+		return fmt.Errorf("pykrill/pykrill.py not found")
 	}
 	
 	// Start daemon process in background
