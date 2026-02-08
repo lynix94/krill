@@ -103,6 +103,12 @@ const dashboardHTML = `<!DOCTYPE html>
         button:active {
             transform: translateY(0);
         }
+        .btn-execute {
+            padding: 18px 40px !important;
+            font-size: 18px !important;
+            font-weight: 700 !important;
+            margin-top: 20px;
+        }
         .btn-secondary {
             background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
             margin-top: 10px;
@@ -295,19 +301,37 @@ const dashboardHTML = `<!DOCTYPE html>
                     </select>
                 </div>
                 <div id="timeRangeGroup" class="form-group" style="display: none;">
-                    <label>Time Range:</label>
+                    <div class="form-group">
+                        <label for="quickTimeRange">Quick Time Range:</label>
+                        <select id="quickTimeRange" onchange="applyQuickRange()">
+                            <option value="">-- Select a time range --</option>
+                            <option value="300">Last 5 minutes</option>
+                            <option value="900">Last 15 minutes</option>
+                            <option value="1800">Last 30 minutes</option>
+                            <option value="3600" selected>Last 1 hour</option>
+                            <option value="10800">Last 3 hours</option>
+                            <option value="21600">Last 6 hours</option>
+                            <option value="43200">Last 12 hours</option>
+                            <option value="86400">Last 24 hours</option>
+                            <option value="172800">Last 2 days</option>
+                            <option value="604800">Last 7 days</option>
+                            <option value="2592000">Last 30 days</option>
+                            <option value="7776000">Last 90 days</option>
+                        </select>
+                    </div>
+                    <label>Custom Range:</label>
                     <div class="time-range">
                         <div>
-                            <label for="startTime">Start (hours ago):</label>
-                            <input type="number" id="startTime" value="1" min="0" max="24">
+                            <label for="startTime">From:</label>
+                            <input type="datetime-local" id="startTime">
                         </div>
                         <div>
-                            <label for="endTime">End (hours ago):</label>
-                            <input type="number" id="endTime" value="0" min="0" max="24">
+                            <label for="endTime">To:</label>
+                            <input type="datetime-local" id="endTime">
                         </div>
                     </div>
                 </div>
-                <button onclick="executeQuery()">Execute Query</button>
+                <button class="btn-execute" onclick="executeQuery()">Execute Query</button>
                 
                 <div id="queryResult" class="result-box" style="display: none;">
                     <pre id="queryOutput"></pre>
@@ -355,7 +379,7 @@ const dashboardHTML = `<!DOCTYPE html>
                     <label for="writeTime">Timestamp (optional):</label>
                     <input type="number" id="writeTime" placeholder="Unix timestamp (leave empty for now)">
                 </div>
-                <button onclick="writeData()">Write Data Point</button>
+                <button class="btn-execute" onclick="writeData()">Write Data Point</button>
                 <div id="writeResult"></div>
 
                 <div class="stats" style="margin-top: 30px;">
@@ -383,7 +407,7 @@ const dashboardHTML = `<!DOCTYPE html>
                     <label for="metricsFilter">Filter (regex):</label>
                     <input type="text" id="metricsFilter" placeholder="e.g., cpu|memory, ^http, usage$" onkeyup="filterMetrics()">
                 </div>
-                <button onclick="loadAllMetrics()">Refresh Metrics</button>
+                <button class="btn-execute" onclick="loadAllMetrics()">Refresh Metrics</button>
                 
                 <div id="metricsResult" class="result-box" style="margin-top: 20px;">
                     <div style="text-align: center; padding: 40px; color: #999;">
@@ -540,6 +564,40 @@ const dashboardHTML = `<!DOCTYPE html>
             const queryType = document.getElementById('queryType').value;
             const timeRangeGroup = document.getElementById('timeRangeGroup');
             timeRangeGroup.style.display = queryType === 'range' ? 'block' : 'none';
+            if (queryType === 'range') {
+                initTimeInputs();
+            }
+        }
+
+        function initTimeInputs() {
+            const now = new Date();
+            const oneHourAgo = new Date(now.getTime() - 3600000);
+            document.getElementById('endTime').value = formatDateTimeLocal(now);
+            document.getElementById('startTime').value = formatDateTimeLocal(oneHourAgo);
+        }
+
+        function formatDateTimeLocal(date) {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            const hours = String(date.getHours()).padStart(2, '0');
+            const minutes = String(date.getMinutes()).padStart(2, '0');
+            return year + '-' + month + '-' + day + 'T' + hours + ':' + minutes;
+        }
+
+        function setTimeRange(seconds) {
+            const now = new Date();
+            const start = new Date(now.getTime() - (seconds * 1000));
+            document.getElementById('endTime').value = formatDateTimeLocal(now);
+            document.getElementById('startTime').value = formatDateTimeLocal(start);
+        }
+
+        function applyQuickRange() {
+            const select = document.getElementById('quickTimeRange');
+            const seconds = parseInt(select.value);
+            if (seconds > 0) {
+                setTimeRange(seconds);
+            }
         }
 
         async function loadMetrics() {
@@ -582,17 +640,24 @@ const dashboardHTML = `<!DOCTYPE html>
                     chartContainer.style.display = 'none';
                     outputPre.textContent = JSON.stringify(data, null, 2);
                 } else {
-                    const now = Math.floor(Date.now() / 1000);
-                    const startHours = parseInt(document.getElementById('startTime').value) || 1;
-                    const endHours = parseInt(document.getElementById('endTime').value) || 0;
-                    const start = now - (startHours * 3600);
-                    const end = now - (endHours * 3600);
+                    const startInput = document.getElementById('startTime').value;
+                    const endInput = document.getElementById('endTime').value;
+                    
+                    if (!startInput || !endInput) {
+                        alert('Please select time range');
+                        return;
+                    }
+                    
+                    const start = Math.floor(new Date(startInput).getTime() / 1000);
+                    const end = Math.floor(new Date(endInput).getTime() / 1000);
                     
                     // Calculate appropriate step based on time range
                     const timeRange = end - start;
                     let step = 15; // default 15 seconds
-                    if (timeRange > 86400) {
-                        step = 300; // 5 minutes for ranges > 1 day
+                    if (timeRange > 604800) {
+                        step = 3600; // 1 hour for ranges > 7 days
+                    } else if (timeRange > 86400) {
+                        step = 600; // 10 minutes for ranges > 1 day
                     } else if (timeRange > 3600) {
                         step = 60; // 1 minute for ranges > 1 hour
                     }
@@ -608,7 +673,7 @@ const dashboardHTML = `<!DOCTYPE html>
                     
                     // Draw chart
                     if (data.status === 'success' && data.data.result && data.data.result.length > 0) {
-                        drawChart(data.data.result[0], metric);
+                        drawChart(data.data.result[0], metric, start, end, step);
                         chartContainer.style.display = 'block';
                     }
                 }
@@ -624,7 +689,7 @@ const dashboardHTML = `<!DOCTYPE html>
             }
         }
 
-        function drawChart(result, metricName) {
+        function drawChart(result, metricName, start, end, step) {
             const canvas = document.getElementById('metricsChart');
             const ctx = canvas.getContext('2d');
             
@@ -632,15 +697,39 @@ const dashboardHTML = `<!DOCTYPE html>
                 chart.destroy();
             }
             
+            // Create a map of existing data points
+            const dataMap = new Map();
+            let firstDataTs = null;
+            let lastDataTs = null;
+            
+            if (result.values && result.values.length > 0) {
+                result.values.forEach(point => {
+                    const ts = point[0];
+                    dataMap.set(ts, parseFloat(point[1]));
+                    if (firstDataTs === null || ts < firstDataTs) firstDataTs = ts;
+                    if (lastDataTs === null || ts > lastDataTs) lastDataTs = ts;
+                });
+            }
+            
+            // If no data, return empty chart
+            if (firstDataTs === null) {
+                return;
+            }
+            
+            // Generate timestamps from first data point to last data point
             const labels = [];
             const values = [];
             
-            if (result.values) {
-                result.values.forEach(point => {
-                    const date = new Date(point[0] * 1000);
-                    labels.push(date.toLocaleTimeString());
-                    values.push(parseFloat(point[1]));
-                });
+            for (let ts = firstDataTs; ts <= lastDataTs; ts += step) {
+                const date = new Date(ts * 1000);
+                labels.push(date.toLocaleString());
+                
+                // Use the actual value if it exists, otherwise null (will show as gap)
+                if (dataMap.has(ts)) {
+                    values.push(dataMap.get(ts));
+                } else {
+                    values.push(null);
+                }
             }
             
             chart = new Chart(ctx, {
@@ -653,7 +742,8 @@ const dashboardHTML = `<!DOCTYPE html>
                         borderColor: 'rgb(102, 126, 234)',
                         backgroundColor: 'rgba(102, 126, 234, 0.1)',
                         tension: 0.4,
-                        fill: true
+                        fill: true,
+                        spanGaps: false  // Don't connect across null values
                     }]
                 },
                 options: {
@@ -663,11 +753,27 @@ const dashboardHTML = `<!DOCTYPE html>
                         legend: {
                             display: true,
                             position: 'top'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    if (context.parsed.y === null) {
+                                        return metricName + ': No data';
+                                    }
+                                    return metricName + ': ' + context.parsed.y;
+                                }
+                            }
                         }
                     },
                     scales: {
                         y: {
                             beginAtZero: false
+                        },
+                        x: {
+                            ticks: {
+                                maxRotation: 45,
+                                minRotation: 45
+                            }
                         }
                     }
                 }
