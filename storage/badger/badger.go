@@ -201,30 +201,36 @@ func (bdb *BadgerTSDB) writeBatchChunk(points []storage.DataPoint) error {
 	}
 	bucketPoints := make(map[bucketKey][]storage.DataPoint)
 	
+	// Store labels with proper locking
+	bdb.labelsMu.Lock()
 	for _, point := range points {
 		seriesID := point.Labels.Hash()
 		bucket := point.Timestamp / 3600 * 3600
 		key := bucketKey{seriesID, bucket}
 		bucketPoints[key] = append(bucketPoints[key], point)
 		
-		// Store labels mapping
-		bdb.labelsMu.Lock()
+		// Store labels mapping (already holding lock)
 		bdb.labels[seriesID] = point.Labels.Copy()
 		bdb.formattedMetrics[seriesID] = formatLabelsAsMetricString(point.Labels)
-		bdb.labelsMu.Unlock()
 	}
+	bdb.labelsMu.Unlock()
 	
 	// Invalidate cache
 	bdb.metricsCacheMu.Lock()
 	bdb.metricsCache = nil
 	bdb.metricsCacheMu.Unlock()
 	
-	// Store labels metadata
+	// Store labels metadata (need to read labels again with lock)
 	labelsSeen := make(map[uint64]bool)
 	for key := range bucketPoints {
 		if !labelsSeen[key.seriesID] {
 			labelsSeen[key.seriesID] = true
-			if err := bdb.storeLabelsMetadata(key.seriesID, bdb.labels[key.seriesID]); err != nil {
+			
+			bdb.labelsMu.RLock()
+			labels := bdb.labels[key.seriesID]
+			bdb.labelsMu.RUnlock()
+			
+			if err := bdb.storeLabelsMetadata(key.seriesID, labels); err != nil {
 				return fmt.Errorf("failed to store labels metadata: %w", err)
 			}
 		}
