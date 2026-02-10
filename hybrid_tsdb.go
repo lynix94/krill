@@ -22,6 +22,9 @@ type HybridTSDB struct {
 	mu               sync.RWMutex
 	stopCleanup      chan struct{}
 	cleanupDone      chan struct{}
+	metricsCache     []string      // cached GetMetrics() result
+	metricsCacheTime time.Time     // last cache update time
+	metricsCacheTTL  time.Duration // cache TTL (default 5 minutes)
 }
 
 // HybridOptions contains configuration for HybridTSDB
@@ -64,6 +67,7 @@ func NewHybridTSDB(opts HybridOptions) (*HybridTSDB, error) {
 		cleanupInterval: opts.CleanupInterval,
 		stopCleanup:     make(chan struct{}),
 		cleanupDone:     make(chan struct{}),
+		metricsCacheTTL: 5 * time.Minute, // 5 minutes cache
 	}
 
 	// Start background cleanup goroutine
@@ -98,6 +102,11 @@ func (h *HybridTSDB) PutLabels(ts int64, labels storage.Labels, value float64) e
 	if err := h.persistStorage.PutLabels(ts, labels, value); err != nil {
 		return fmt.Errorf("failed to write to persistent storage: %w", err)
 	}
+
+	// Invalidate metrics cache when new data is added
+	h.mu.Lock()
+	h.metricsCache = nil
+	h.mu.Unlock()
 
 	return nil
 }
@@ -228,6 +237,17 @@ func (h *HybridTSDB) GetLabels(labels storage.Labels, startTs, endTs int64) ([]i
 
 // GetMetrics returns all metric names from both cache and persistent storage
 func (h *HybridTSDB) GetMetrics() ([]string, error) {
+	// Check cache first
+	h.mu.RLock()
+	if h.metricsCache != nil && time.Since(h.metricsCacheTime) < h.metricsCacheTTL {
+		result := make([]string, len(h.metricsCache))
+		copy(result, h.metricsCache)
+		h.mu.RUnlock()
+		return result, nil
+	}
+	h.mu.RUnlock()
+
+	// Cache miss or expired, rebuild
 	metricsMap := make(map[string]bool)
 
 	// Get from memory cache
@@ -253,6 +273,12 @@ func (h *HybridTSDB) GetMetrics() ([]string, error) {
 	for m := range metricsMap {
 		metrics = append(metrics, m)
 	}
+
+	// Update cache
+	h.mu.Lock()
+	h.metricsCache = metrics
+	h.metricsCacheTime = time.Now()
+	h.mu.Unlock()
 
 	return metrics, nil
 }

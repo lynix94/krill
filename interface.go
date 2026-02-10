@@ -3,6 +3,7 @@ package krill
 import (
 	"time"
 
+	"github.com/lynix/krill/storage"
 	"github.com/lynix/krill/storage/badger"
 )
 
@@ -25,6 +26,9 @@ type QueryableDB interface {
 	
 	// GetMetrics returns all metric names
 	GetMetrics() ([]string, error)
+	
+	// GetAllSeries returns all series (labels) in the database
+	GetAllSeries() ([]storage.Labels, error)
 }
 
 // Ensure implementations satisfy the interfaces

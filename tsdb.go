@@ -34,6 +34,11 @@ func (db *TSDB) GetMetrics() ([]string, error) {
 	return db.storage.GetMetrics()
 }
 
+// GetAllSeries returns all series (labels) in the database
+func (db *TSDB) GetAllSeries() ([]storage.Labels, error) {
+	return db.storage.GetAllSeries()
+}
+
 // Close closes the database (no-op for in-memory implementation)
 func (db *TSDB) Close() error {
 	return db.storage.Close()

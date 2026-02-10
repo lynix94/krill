@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lynix/krill"
+	"github.com/lynix/krill/storage"
 )
 
 // PrometheusHandler handles Prometheus-compatible API requests
@@ -101,8 +102,8 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 	// Parse query with aggregation support
 	parsed := parsePromQL(query)
 
-	// Get all metrics and filter by label matchers
-	metrics, err := ph.tsdb.GetMetrics()
+	// Get all series (Labels) instead of formatted strings - much faster!
+	allSeries, err := ph.tsdb.GetAllSeries()
 	if err != nil {
 		ph.sendError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -120,10 +121,13 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 		endTs = queryTime
 	}
 
-	// Filter metrics by name and labels
+	// Filter series by name and labels (no string parsing needed!)
 	var result []QueryResult
-	for _, metric := range metrics {
-		if matchesQuery(metric, parsed.MetricName, parsed.LabelMatchers) {
+	for _, labels := range allSeries {
+		if matchesLabels(labels, parsed.MetricName, parsed.LabelMatchers) {
+			// Format labels to metric key for DB lookup
+			metric := formatLabelsAsMetricString(labels)
+			
 			// Query TSDB for this specific metric
 			timestamps, values, err := ph.tsdb.Get(metric, startTs, endTs)
 			if err != nil {
@@ -131,9 +135,11 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 			}
 
 			if len(values) > 0 {
-				// Parse metric name and tags from stored key
-				parsedName, parsedTags := parseMetricKey(metric)
-				parsedTags["__name__"] = parsedName
+				// Build tags map from labels (already parsed!)
+				parsedTags := make(map[string]string)
+				for _, label := range labels {
+					parsedTags[label.Name] = label.Value
+				}
 
 				if parsed.RangeVector > 0 {
 					// Range vector: return all values in range
@@ -259,17 +265,20 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Get all metrics and filter by label matchers
-	metrics, err := ph.tsdb.GetMetrics()
+	// Get all series (Labels) instead of formatted strings - much faster!
+	allSeries, err := ph.tsdb.GetAllSeries()
 	if err != nil {
 		ph.sendError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// Filter metrics by name and labels
+	// Filter series by name and labels (no string parsing needed!)
 	var result []QueryResult
-	for _, metric := range metrics {
-		if matchesQuery(metric, parsed.MetricName, parsed.LabelMatchers) {
+	for _, labels := range allSeries {
+		if matchesLabels(labels, parsed.MetricName, parsed.LabelMatchers) {
+			// Format labels to metric key for DB lookup
+			metric := formatLabelsAsMetricString(labels)
+			
 			// Query TSDB for this specific metric
 			timestamps, values, err := ph.tsdb.Get(metric, start, end)
 			if err != nil {
@@ -286,9 +295,11 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 				for i := range values {
 					valuesArray[i] = []interface{}{timestamps[i], fmt.Sprintf("%f", values[i])}
 				}
-				// Parse metric name and tags from stored key
-				parsedName, parsedTags := parseMetricKey(metric)
-				parsedTags["__name__"] = parsedName
+				// Build tags map from labels (already parsed!)
+				parsedTags := make(map[string]string)
+				for _, label := range labels {
+					parsedTags[label.Name] = label.Value
+				}
 				result = append(result, QueryResult{
 					Metric: parsedTags,
 					Values: valuesArray,
@@ -466,7 +477,50 @@ func parseQuery(query string) (string, map[string]string) {
 	return parseMetricKey(query)
 }
 
+// formatLabelsAsMetricString converts Labels to metric string format for DB lookup
+func formatLabelsAsMetricString(labels storage.Labels) string {
+	name := labels.Get("__name__")
+	if name == "" {
+		name = "unknown"
+	}
+	
+	// Collect non-name labels
+	var tagParts []string
+	for _, label := range labels {
+		if label.Name != "__name__" {
+			tagParts = append(tagParts, fmt.Sprintf("%s=\"%s\"", label.Name, label.Value))
+		}
+	}
+	
+	if len(tagParts) == 0 {
+		return name
+	}
+	
+	return fmt.Sprintf("%s{%s}", name, strings.Join(tagParts, ","))
+}
+
+// matchesLabels checks if Labels match the query (name and label matchers) - no string parsing!
+func matchesLabels(labels storage.Labels, queryName string, labelMatchers map[string]string) bool {
+	// Check name match (empty query name matches all)
+	if queryName != "" {
+		name := labels.Get("__name__")
+		if name != queryName {
+			return false
+		}
+	}
+	
+	// Check all label matchers
+	for k, v := range labelMatchers {
+		if labels.Get(k) != v {
+			return false
+		}
+	}
+	
+	return true
+}
+
 // matchesQuery checks if a metric key matches the query (name and label matchers)
+// Deprecated: Use matchesLabels for better performance
 func matchesQuery(metricKey string, queryName string, labelMatchers map[string]string) bool {
 	parsedName, parsedTags := parseMetricKey(metricKey)
 	

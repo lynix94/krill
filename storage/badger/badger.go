@@ -17,10 +17,15 @@ import (
 
 // BadgerTSDB is a persistent time-series database using BadgerDB
 type BadgerTSDB struct {
-	db         *badger.DB
-	ttl        time.Duration
-	labels     map[uint64]storage.Labels // seriesID -> labels mapping
-	labelsMu   sync.RWMutex              // Protects labels map
+	db                *badger.DB
+	ttl               time.Duration
+	labels            map[uint64]storage.Labels // seriesID -> labels mapping
+	labelsMu          sync.RWMutex              // Protects labels map
+	formattedMetrics  map[uint64]string         // seriesID -> formatted metric string cache
+	metricsCache      []string                  // cached GetMetrics() result
+	metricsCacheTime  time.Time                 // last cache update time
+	metricsCacheMu    sync.RWMutex              // Protects metrics cache
+	metricsCacheTTL   time.Duration             // cache TTL (default 5 minutes)
 }
 
 // BadgerOptions contains configuration for BadgerTSDB
@@ -45,9 +50,11 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 	}
 
 	bdb := &BadgerTSDB{
-		db:     db,
-		ttl:    opts.TTL,
-		labels: make(map[uint64]storage.Labels),
+		db:               db,
+		ttl:              opts.TTL,
+		labels:           make(map[uint64]storage.Labels),
+		formattedMetrics: make(map[uint64]string),
+		metricsCacheTTL:  5 * time.Minute, // 5 minutes cache
 	}
 
 	// Load all series labels from database
@@ -66,7 +73,14 @@ func (bdb *BadgerTSDB) PutLabels(ts int64, labels storage.Labels, value float64)
 	// Store labels mapping in memory with proper locking
 	bdb.labelsMu.Lock()
 	bdb.labels[seriesID] = labels.Copy()
+	// Cache the formatted metric string
+	bdb.formattedMetrics[seriesID] = formatLabelsAsMetricString(labels)
 	bdb.labelsMu.Unlock()
+	
+	// Invalidate GetMetrics cache when new series is added
+	bdb.metricsCacheMu.Lock()
+	bdb.metricsCache = nil
+	bdb.metricsCacheMu.Unlock()
 	
 	// Store labels metadata in BadgerDB for persistence
 	if err := bdb.storeLabelsMetadata(seriesID, labels); err != nil {
@@ -264,12 +278,29 @@ func (bdb *BadgerTSDB) GetAllSeries() ([]storage.Labels, error) {
 
 // GetMetrics returns all metric names (legacy API, returns formatted strings)
 func (bdb *BadgerTSDB) GetMetrics() ([]string, error) {
+	// Check cache first
+	bdb.metricsCacheMu.RLock()
+	if bdb.metricsCache != nil && time.Since(bdb.metricsCacheTime) < bdb.metricsCacheTTL {
+		result := make([]string, len(bdb.metricsCache))
+		copy(result, bdb.metricsCache)
+		bdb.metricsCacheMu.RUnlock()
+		return result, nil
+	}
+	bdb.metricsCacheMu.RUnlock()
+
+	// Cache miss or expired, rebuild
 	metrics := make(map[string]bool)
 
 	bdb.labelsMu.RLock()
-	for _, labels := range bdb.labels {
-		metricStr := formatLabelsAsMetricString(labels)
-		metrics[metricStr] = true
+	// Use cached formatted strings instead of formatting each time
+	for seriesID := range bdb.labels {
+		if metricStr, ok := bdb.formattedMetrics[seriesID]; ok {
+			metrics[metricStr] = true
+		} else {
+			// Fallback: format if not cached (shouldn't happen)
+			metricStr = formatLabelsAsMetricString(bdb.labels[seriesID])
+			metrics[metricStr] = true
+		}
 	}
 	bdb.labelsMu.RUnlock()
 
@@ -277,6 +308,12 @@ func (bdb *BadgerTSDB) GetMetrics() ([]string, error) {
 	for metric := range metrics {
 		result = append(result, metric)
 	}
+
+	// Update cache
+	bdb.metricsCacheMu.Lock()
+	bdb.metricsCache = result
+	bdb.metricsCacheTime = time.Now()
+	bdb.metricsCacheMu.Unlock()
 
 	return result, nil
 }
@@ -339,9 +376,14 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 			}
 		}
 
-		// Update labels map with proper locking
+		// Update labels map and build formatted metrics cache with proper locking
 		bdb.labelsMu.Lock()
 		bdb.labels = loadedSeries
+		// Pre-build formatted metrics cache
+		bdb.formattedMetrics = make(map[uint64]string, len(loadedSeries))
+		for seriesID, labels := range loadedSeries {
+			bdb.formattedMetrics[seriesID] = formatLabelsAsMetricString(labels)
+		}
 		bdb.labelsMu.Unlock()
 		return nil
 	})
