@@ -23,6 +23,11 @@ func (db *TSDB) TsdbPut(ts int64, metric string, value float64) error {
 	return db.storage.Put(ts, metric, value)
 }
 
+// TsdbPutBatch stores multiple time-series data points efficiently
+func (db *TSDB) TsdbPutBatch(points []storage.DataPoint) error {
+	return db.storage.PutBatch(points)
+}
+
 // Get retrieves all data points for a metric within a time range
 // Pass 0 for startTs and endTs to get all data
 func (db *TSDB) Get(metric string, startTs, endTs int64) ([]int64, []float64, error) {

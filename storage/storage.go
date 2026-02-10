@@ -1,5 +1,12 @@
 package storage
 
+// DataPoint represents a single time-series data point with labels
+type DataPoint struct {
+	Timestamp int64
+	Labels    Labels
+	Value     float64
+}
+
 // Storage is the interface for time-series storage backends
 type Storage interface {
 	// Put stores a single data point
@@ -7,6 +14,9 @@ type Storage interface {
 	
 	// PutLabels stores a data point with labels
 	PutLabels(ts int64, labels Labels, value float64) error
+	
+	// PutBatch stores multiple data points efficiently
+	PutBatch(points []DataPoint) error
 	
 	// Get retrieves data points for a metric within a time range
 	// Use startTs=0, endTs=0 to get all data

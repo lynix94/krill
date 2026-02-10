@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -380,34 +381,37 @@ func (ph *PrometheusHandler) HandleBatchWrite(w http.ResponseWriter, r *http.Req
 	}
 
 	now := time.Now().Unix()
-	errorCount := 0
-
+	
+	// Convert to DataPoint slice for efficient batch processing
+	points := make([]storage.DataPoint, 0, len(requests))
 	for _, req := range requests {
 		if req.Metric == "" {
-			errorCount++
 			continue
 		}
 
 		// Use current time if not specified
-		if req.Time == 0 {
-			req.Time = now
+		timestamp := req.Time
+		if timestamp == 0 {
+			timestamp = now
 		}
 
-		// Build metric key with tags
-		metricKey := buildMetricKey(req.Metric, req.Tags)
-
-		// Write to TSDB
-		if err := ph.tsdb.TsdbPut(req.Time, metricKey, req.Value); err != nil {
-			errorCount++
-		}
+		// Parse metric and tags into Labels
+		labels := buildLabels(req.Metric, req.Tags)
+		
+		points = append(points, storage.DataPoint{
+			Timestamp: timestamp,
+			Labels:    labels,
+			Value:     req.Value,
+		})
 	}
 
-	if errorCount > 0 {
-		ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to write %d/%d metrics", errorCount, len(requests)))
+	// Batch write to TSDB (much more efficient!)
+	if err := ph.tsdb.TsdbPutBatch(points); err != nil {
+		ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to write batch: %v", err))
 		return
 	}
 
-	ph.sendSuccess(w, map[string]int{"written": len(requests)})
+	ph.sendSuccess(w, map[string]int{"written": len(points)})
 }
 
 // HandleMetrics returns list of all metrics: GET /api/v1/label/__name__/values or GET /api/v1/metrics
@@ -475,6 +479,20 @@ func buildMetricKey(name string, tags map[string]string) string {
 	}
 
 	return fmt.Sprintf("%s{%s}", name, strings.Join(sortedTags, ","))
+}
+
+// buildLabels creates a Labels object from metric name and tags
+func buildLabels(name string, tags map[string]string) storage.Labels {
+	labels := make(storage.Labels, 0, len(tags)+1)
+	labels = append(labels, storage.Label{Name: "__name__", Value: name})
+	
+	for k, v := range tags {
+		labels = append(labels, storage.Label{Name: k, Value: v})
+	}
+	
+	// Sort for consistency using sort.Sort
+	sort.Sort(labels)
+	return labels
 }
 
 // parseMetricKey parses a metric key back into name and tags

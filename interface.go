@@ -12,6 +12,9 @@ type TimeSeriesDB interface {
 	// TsdbPut stores a time-series data point
 	TsdbPut(ts int64, metric string, value float64) error
 	
+	// TsdbPutBatch stores multiple time-series data points efficiently
+	TsdbPutBatch(points []storage.DataPoint) error
+	
 	// Close closes the database and releases resources
 	Close() error
 }

@@ -29,6 +29,11 @@ func (ps *PersistenceStorage) PutLabels(ts int64, labels storage.Labels, value f
 	return ps.db.PutLabels(ts, labels, value)
 }
 
+// PutBatch stores multiple data points efficiently
+func (ps *PersistenceStorage) PutBatch(points []storage.DataPoint) error {
+	return ps.db.PutBatch(points)
+}
+
 // Get retrieves data points for a metric within a time range
 func (ps *PersistenceStorage) Get(metric string, startTs, endTs int64) ([]int64, []float64, error) {
 	return ps.db.Get(metric, startTs, endTs)

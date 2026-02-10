@@ -45,6 +45,63 @@ func (ms *MemoryStorage) Put(ts int64, metric string, value float64) error {
 	return ms.PutLabels(ts, labels, value)
 }
 
+// PutBatch stores multiple time-series data points efficiently
+func (ms *MemoryStorage) PutBatch(points []storage.DataPoint) error {
+	// Group points by series ID for efficient processing
+	seriesPoints := make(map[uint64][]storage.DataPoint)
+	for _, point := range points {
+		seriesID := point.Labels.Hash()
+		seriesPoints[seriesID] = append(seriesPoints[seriesID], point)
+	}
+	
+	// Process each series
+	for seriesID, points := range seriesPoints {
+		ms.mu.Lock()
+		series, exists := ms.series[seriesID]
+		if !exists {
+			series = &MetricSeries{
+				id:              seriesID,
+				timestampStream: gorilla.NewTimestampEncoder(),
+				valueStream:     gorilla.NewValueEncoder(),
+			}
+			ms.series[seriesID] = series
+			ms.labels[seriesID] = points[0].Labels.Copy()
+		}
+		ms.mu.Unlock()
+		
+		// Write all points for this series
+		series.mu.Lock()
+		for _, point := range points {
+			if series.count == 0 {
+				series.firstTimestamp = point.Timestamp
+				series.lastTimestamp = point.Timestamp
+				series.firstValue = point.Value
+				series.lastValue = point.Value
+				series.count++
+				continue
+			}
+			
+			if point.Timestamp < series.lastTimestamp {
+				continue // Skip old data
+			}
+			if point.Timestamp == series.lastTimestamp {
+				continue // Skip duplicate
+			}
+			
+			delta := point.Timestamp - series.lastTimestamp
+			series.timestampStream.Encode(delta)
+			series.valueStream.Encode(point.Value, series.lastValue)
+			
+			series.lastTimestamp = point.Timestamp
+			series.lastValue = point.Value
+			series.count++
+		}
+		series.mu.Unlock()
+	}
+	
+	return nil
+}
+
 // PutLabels stores a time-series data point using Labels
 func (ms *MemoryStorage) PutLabels(ts int64, labels storage.Labels, value float64) error {
 	seriesID := labels.Hash()

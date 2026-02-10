@@ -172,6 +172,124 @@ func (bdb *BadgerTSDB) TsdbPut(ts int64, metric string, value float64) error {
 	return bdb.PutLabels(ts, labels, value)
 }
 
+// TsdbPutBatch stores multiple time-series data points efficiently
+func (bdb *BadgerTSDB) TsdbPutBatch(points []storage.DataPoint) error {
+	// Group points by series ID and bucket for efficient batching
+	type bucketKey struct {
+		seriesID uint64
+		bucket   int64
+	}
+	bucketPoints := make(map[bucketKey][]storage.DataPoint)
+	
+	for _, point := range points {
+		seriesID := point.Labels.Hash()
+		bucket := point.Timestamp / 3600 * 3600
+		key := bucketKey{seriesID, bucket}
+		bucketPoints[key] = append(bucketPoints[key], point)
+		
+		// Store labels mapping
+		bdb.labelsMu.Lock()
+		bdb.labels[seriesID] = point.Labels.Copy()
+		bdb.formattedMetrics[seriesID] = formatLabelsAsMetricString(point.Labels)
+		bdb.labelsMu.Unlock()
+	}
+	
+	// Invalidate cache
+	bdb.metricsCacheMu.Lock()
+	bdb.metricsCache = nil
+	bdb.metricsCacheMu.Unlock()
+	
+	// Store labels metadata
+	labelsSeen := make(map[uint64]bool)
+	for key := range bucketPoints {
+		if !labelsSeen[key.seriesID] {
+			labelsSeen[key.seriesID] = true
+			if err := bdb.storeLabelsMetadata(key.seriesID, bdb.labels[key.seriesID]); err != nil {
+				return fmt.Errorf("failed to store labels metadata: %w", err)
+			}
+		}
+	}
+	
+	// Batch write all points
+	return bdb.db.Update(func(txn *badger.Txn) error {
+		for bKey, points := range bucketPoints {
+			key := makeKeyFromID(bKey.seriesID, bKey.bucket)
+			
+			// Get existing series for this bucket
+			var existingTimestamps []int64
+			var existingValues []float64
+			
+			item, err := txn.Get(key)
+			if err == nil {
+				err = item.Value(func(val []byte) error {
+					series, err := DeserializeSeriesBlock(val)
+					if err != nil {
+						return err
+					}
+					existingTimestamps, existingValues, err = series.Decode()
+					return err
+				})
+				if err != nil {
+					return err
+				}
+			} else if err != badger.ErrKeyNotFound {
+				return err
+			}
+			
+			// Add new points
+			for _, point := range points {
+				if len(existingTimestamps) > 0 {
+					lastTs := existingTimestamps[len(existingTimestamps)-1]
+					if point.Timestamp < lastTs {
+						continue
+					}
+					if point.Timestamp == lastTs {
+						continue
+					}
+				}
+				existingTimestamps = append(existingTimestamps, point.Timestamp)
+				existingValues = append(existingValues, point.Value)
+			}
+			
+			// Create new series block
+			series := &SeriesBlock{
+				SeriesID:         bKey.seriesID,
+				StartTimestamp:   bKey.bucket,
+				timestampEncoder: gorilla.NewTimestampEncoder(),
+				valueEncoder:     gorilla.NewValueEncoder(),
+			}
+			
+			// Encode all points
+			for i, timestamp := range existingTimestamps {
+				if err := series.AddPoint(timestamp, existingValues[i]); err != nil {
+					return err
+				}
+			}
+			
+			// Serialize and store
+			data, err := series.Serialize()
+			if err != nil {
+				return err
+			}
+			
+			entry := badger.NewEntry(key, data)
+			if bdb.ttl > 0 {
+				entry = entry.WithTTL(bdb.ttl)
+			}
+			
+			if err := txn.SetEntry(entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// PutBatch implements Storage interface batch write
+func (bdb *BadgerTSDB) PutBatch(points []storage.DataPoint) error {
+	return bdb.TsdbPutBatch(points)
+}
+
 // GetLabels retrieves all data points for a series within a time range using Labels
 func (bdb *BadgerTSDB) GetLabels(labels storage.Labels, startTs, endTs int64) ([]int64, []float64, error) {
 	if endTs == 0 {

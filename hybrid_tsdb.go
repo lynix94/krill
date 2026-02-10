@@ -91,6 +91,21 @@ func (h *HybridTSDB) TsdbPut(ts int64, metric string, value float64) error {
 	return nil
 }
 
+// TsdbPutBatch stores multiple data points efficiently
+func (h *HybridTSDB) TsdbPutBatch(points []storage.DataPoint) error {
+	// Write to memory cache first (fast path)
+	if err := h.memoryCache.PutBatch(points); err != nil {
+		return fmt.Errorf("failed to write batch to memory cache: %w", err)
+	}
+
+	// Write to persistent storage
+	if err := h.persistStorage.PutBatch(points); err != nil {
+		return fmt.Errorf("failed to write batch to persistent storage: %w", err)
+	}
+
+	return nil
+}
+
 // PutLabels stores a data point with labels in both memory cache and persistent storage (dual write)
 func (h *HybridTSDB) PutLabels(ts int64, labels storage.Labels, value float64) error {
 	// Write to memory cache first (fast path)
