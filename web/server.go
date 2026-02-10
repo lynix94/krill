@@ -36,6 +36,7 @@ func NewServer(opts ServerOptions) *Server {
 	mux.HandleFunc("/api/v1/query", handler.HandleQuery)
 	mux.HandleFunc("/api/v1/query_range", handler.HandleQueryRange)
 	mux.HandleFunc("/api/v1/write", handler.HandleWrite)
+	mux.HandleFunc("/api/v1/write/batch", handler.HandleBatchWrite)
 	mux.HandleFunc("/api/v1/metrics", handler.HandleMetrics)
 	mux.HandleFunc("/api/v1/label/__name__/values", handler.HandleMetrics)
 	

@@ -361,6 +361,55 @@ func (ph *PrometheusHandler) HandleWrite(w http.ResponseWriter, r *http.Request)
 	ph.sendSuccess(w, nil)
 }
 
+// HandleBatchWrite handles batch write requests: POST /api/v1/write/batch
+func (ph *PrometheusHandler) HandleBatchWrite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var requests []WriteRequest
+	if err := json.NewDecoder(r.Body).Decode(&requests); err != nil {
+		ph.sendError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	if len(requests) == 0 {
+		ph.sendError(w, http.StatusBadRequest, "empty batch request")
+		return
+	}
+
+	now := time.Now().Unix()
+	errorCount := 0
+
+	for _, req := range requests {
+		if req.Metric == "" {
+			errorCount++
+			continue
+		}
+
+		// Use current time if not specified
+		if req.Time == 0 {
+			req.Time = now
+		}
+
+		// Build metric key with tags
+		metricKey := buildMetricKey(req.Metric, req.Tags)
+
+		// Write to TSDB
+		if err := ph.tsdb.TsdbPut(req.Time, metricKey, req.Value); err != nil {
+			errorCount++
+		}
+	}
+
+	if errorCount > 0 {
+		ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to write %d/%d metrics", errorCount, len(requests)))
+		return
+	}
+
+	ph.sendSuccess(w, map[string]int{"written": len(requests)})
+}
+
 // HandleMetrics returns list of all metrics: GET /api/v1/label/__name__/values or GET /api/v1/metrics
 // Supports optional 'filter' query parameter with regex pattern
 func (ph *PrometheusHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {

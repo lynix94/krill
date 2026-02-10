@@ -164,8 +164,9 @@ func (s *Scraper) scrapeTarget(config ScrapeConfig, staticConfig StaticConfig, t
 
 	// Send metrics to Krill server via HTTP API
 	now := time.Now().Unix()
-	stored := 0
 	
+	// Build batch of write requests
+	var batch []WriteRequest
 	for _, metric := range metrics {
 		// Merge labels from config and static config
 		allLabels := make(map[string]string)
@@ -197,16 +198,23 @@ func (s *Scraper) scrapeTarget(config ScrapeConfig, staticConfig StaticConfig, t
 			timestamp = timestamp / 1000
 		}
 
-		// Send to Krill server via HTTP with tags
-		if err := s.sendMetric(metricName, metric.Value, timestamp, allLabels); err != nil {
-			log.Printf("Error sending metric %s to server: %v", metricName, err)
-			continue
-		}
-		stored++
+		batch = append(batch, WriteRequest{
+			Metric: metricName,
+			Value:  metric.Value,
+			Time:   timestamp,
+			Tags:   allLabels,
+		})
 	}
 
-	s.recordSuccess(int64(stored))
-	log.Printf("Scraped %s: sent %d/%d metrics to server", target, stored, len(metrics))
+	// Send batch to Krill server
+	if err := s.sendMetricBatch(batch); err != nil {
+		log.Printf("Error sending batch to server: %v", err)
+		s.recordFailure()
+		return
+	}
+
+	s.recordSuccess(int64(len(batch)))
+	log.Printf("Scraped %s: sent %d metrics to server in batch", target, len(batch))
 }
 
 func (s *Scraper) recordSuccess(metricsCount int64) {
@@ -222,7 +230,40 @@ func (s *Scraper) recordFailure() {
 	s.failedScrapes++
 }
 
-// sendMetric sends a single metric to the Krill server via HTTP API
+// sendMetricBatch sends a batch of metrics to the Krill server via HTTP API
+func (s *Scraper) sendMetricBatch(batch []WriteRequest) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	jsonData, err := json.Marshal(batch)
+	if err != nil {
+		return fmt.Errorf("failed to marshal batch: %w", err)
+	}
+
+	url := s.serverURL + "/api/v1/write/batch"
+	httpReq, err := http.NewRequestWithContext(s.ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// sendMetric sends a single metric to the Krill server via HTTP API (deprecated, use batch)
 func (s *Scraper) sendMetric(metric string, value float64, timestamp int64, tags map[string]string) error {
 	req := WriteRequest{
 		Metric: metric,
