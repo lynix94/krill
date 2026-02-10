@@ -644,8 +644,13 @@ const dashboardHTML = `<!DOCTYPE html>
                     
                     resultDiv.style.display = 'block';
                     chartContainer.style.display = 'none';
-                    outputPre.innerHTML = '<strong style="color: #667eea;">⏱️ Response Time: ' + responseTime + ' ms</strong>\n\n' + 
-                                          JSON.stringify(data, null, 2);
+                    
+                    const header = document.createElement('strong');
+                    header.style.color = '#667eea';
+                    header.textContent = '⏱️ Response Time: ' + responseTime + ' ms';
+                    
+                    outputPre.textContent = '\n\n' + JSON.stringify(data, null, 2);
+                    outputPre.prepend(header);
                 } else {
                     const startInput = document.getElementById('startTime').value;
                     const endInput = document.getElementById('endTime').value;
@@ -680,9 +685,21 @@ const dashboardHTML = `<!DOCTYPE html>
                     const dataPoints = data.data?.result?.[0]?.values?.length || 0;
                     
                     resultDiv.style.display = 'block';
-                    outputPre.innerHTML = '<strong style="color: #667eea;">⏱️ Response Time: ' + responseTime + ' ms</strong> | ' +
-                                          '<strong style="color: #764ba2;">📊 Data Points: ' + dataPoints + '</strong>\n\n' +
-                                          JSON.stringify(data, null, 2);
+                    
+                    const header1 = document.createElement('strong');
+                    header1.style.color = '#667eea';
+                    header1.textContent = '⏱️ Response Time: ' + responseTime + ' ms';
+                    
+                    const separator = document.createTextNode(' | ');
+                    
+                    const header2 = document.createElement('strong');
+                    header2.style.color = '#764ba2';
+                    header2.textContent = '📊 Data Points: ' + dataPoints;
+                    
+                    outputPre.textContent = '\n\n' + JSON.stringify(data, null, 2);
+                    outputPre.prepend(header2);
+                    outputPre.prepend(separator);
+                    outputPre.prepend(header1);
                     
                     // Draw chart
                     if (data.status === 'success' && data.data.result && data.data.result.length > 0) {
@@ -701,8 +718,13 @@ const dashboardHTML = `<!DOCTYPE html>
                 
                 resultDiv.style.display = 'block';
                 chartContainer.style.display = 'none';
-                outputPre.innerHTML = '<strong style="color: #f5576c;">⏱️ Response Time: ' + responseTime + ' ms (Error)</strong>\n\n' +
-                                      'Error: ' + error.message;
+                
+                const header = document.createElement('strong');
+                header.style.color = '#f5576c';
+                header.textContent = '⏱️ Response Time: ' + responseTime + ' ms (Error)';
+                
+                outputPre.textContent = '\n\nError: ' + error.message;
+                outputPre.prepend(header);
             }
         }
 
