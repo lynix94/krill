@@ -206,15 +206,31 @@ func (s *Scraper) scrapeTarget(config ScrapeConfig, staticConfig StaticConfig, t
 		})
 	}
 
-	// Send batch to Krill server
-	if err := s.sendMetricBatch(batch); err != nil {
-		log.Printf("Error sending batch to server: %v", err)
-		s.recordFailure()
-		return
+	// Send batch to Krill server (split into chunks if too large)
+	const maxBatchSize = 1000 // Avoid "Txn is too big" error
+	totalSent := 0
+	
+	for i := 0; i < len(batch); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(batch) {
+			end = len(batch)
+		}
+		chunk := batch[i:end]
+		
+		if err := s.sendMetricBatch(chunk); err != nil {
+			log.Printf("Error sending batch chunk to server: %v", err)
+			s.recordFailure()
+			return
+		}
+		totalSent += len(chunk)
 	}
 
-	s.recordSuccess(int64(len(batch)))
-	log.Printf("Scraped %s: sent %d metrics to server in batch", target, len(batch))
+	s.recordSuccess(int64(totalSent))
+	if len(batch) > maxBatchSize {
+		log.Printf("Scraped %s: sent %d metrics to server in %d batches", target, totalSent, (len(batch)+maxBatchSize-1)/maxBatchSize)
+	} else {
+		log.Printf("Scraped %s: sent %d metrics to server in batch", target, totalSent)
+	}
 }
 
 func (s *Scraper) recordSuccess(metricsCount int64) {

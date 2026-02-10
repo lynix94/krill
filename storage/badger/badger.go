@@ -174,6 +174,26 @@ func (bdb *BadgerTSDB) TsdbPut(ts int64, metric string, value float64) error {
 
 // TsdbPutBatch stores multiple time-series data points efficiently
 func (bdb *BadgerTSDB) TsdbPutBatch(points []storage.DataPoint) error {
+	// Split large batches into chunks to avoid "Txn is too big" error
+	const maxChunkSize = 1000 // Process 1000 points per transaction
+	
+	for i := 0; i < len(points); i += maxChunkSize {
+		end := i + maxChunkSize
+		if end > len(points) {
+			end = len(points)
+		}
+		chunk := points[i:end]
+		
+		if err := bdb.writeBatchChunk(chunk); err != nil {
+			return err
+		}
+	}
+	
+	return nil
+}
+
+// writeBatchChunk writes a chunk of points in a single transaction
+func (bdb *BadgerTSDB) writeBatchChunk(points []storage.DataPoint) error {
 	// Group points by series ID and bucket for efficient batching
 	type bucketKey struct {
 		seriesID uint64
