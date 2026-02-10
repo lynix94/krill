@@ -329,6 +329,38 @@ func (h *HybridTSDB) GetAllSeries() ([]storage.Labels, error) {
 	return series, nil
 }
 
+// FindSeriesByLabels finds series IDs matching the given label matchers using inverted index
+// Delegates to persistent storage which has the inverted index
+func (h *HybridTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uint64 {
+	// Type assert to get access to index methods
+	type IndexFinder interface {
+		FindSeriesByLabels(map[string]string) []uint64
+	}
+	
+	if finder, ok := h.persistStorage.(IndexFinder); ok {
+		return finder.FindSeriesByLabels(labelMatchers)
+	}
+	
+	// Fallback: return empty (will trigger full scan)
+	return []uint64{}
+}
+
+// GetLabelsForSeriesID retrieves labels for a given series ID
+// Delegates to persistent storage which has the series ID mapping
+func (h *HybridTSDB) GetLabelsForSeriesID(seriesID uint64) (storage.Labels, bool) {
+	// Type assert to get access to index methods
+	type LabelsGetter interface {
+		GetLabelsForSeriesID(uint64) (storage.Labels, bool)
+	}
+	
+	if getter, ok := h.persistStorage.(LabelsGetter); ok {
+		return getter.GetLabelsForSeriesID(seriesID)
+	}
+	
+	// Fallback: not found
+	return nil, false
+}
+
 // Close closes both storage backends and stops cleanup
 func (h *HybridTSDB) Close() error {
 	// Stop cleanup goroutine

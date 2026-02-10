@@ -54,6 +54,16 @@ func (ps *PersistenceStorage) GetAllSeries() ([]storage.Labels, error) {
 	return ps.db.GetAllSeries()
 }
 
+// FindSeriesByLabels finds series IDs matching the given label matchers using inverted index
+func (ps *PersistenceStorage) FindSeriesByLabels(labelMatchers map[string]string) []uint64 {
+	return ps.db.FindSeriesByLabels(labelMatchers)
+}
+
+// GetLabelsForSeriesID retrieves labels for a given series ID
+func (ps *PersistenceStorage) GetLabelsForSeriesID(seriesID uint64) (storage.Labels, bool) {
+	return ps.db.GetLabelsForSeriesID(seriesID)
+}
+
 // Close closes the storage
 func (ps *PersistenceStorage) Close() error {
 	return ps.db.Close()

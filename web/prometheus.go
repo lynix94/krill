@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"regexp"
@@ -59,12 +60,12 @@ type FunctionStage struct {
 // Can be either a query stage or a function stage
 type KrillQLQuery struct {
 	// Query stage fields
-	Query     string           `json:"query,omitempty"`
-	Start     int64            `json:"start,omitempty"`
-	End       int64            `json:"end,omitempty"`
-	Step      int64            `json:"step,omitempty"`
-	Functions []FunctionStage  `json:"functions,omitempty"`
-	
+	Query     string          `json:"query,omitempty"`
+	Start     int64           `json:"start,omitempty"`
+	End       int64           `json:"end,omitempty"`
+	Step      int64           `json:"step,omitempty"`
+	Functions []FunctionStage `json:"functions,omitempty"`
+
 	// Function stage fields (for backwards compatibility)
 	Function string `json:"function,omitempty"`
 	Type     string `json:"type,omitempty"`
@@ -102,13 +103,8 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 
 	// Parse query with aggregation support
 	parsed := parsePromQL(query)
-
-	// Get all series (Labels) instead of formatted strings - much faster!
-	allSeries, err := ph.tsdb.GetAllSeries()
-	if err != nil {
-		ph.sendError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	log.Printf("[PARSE] Query: %s => MetricName: %q, LabelMatchers: %v, AggFunc: %v",
+		query, parsed.MetricName, parsed.LabelMatchers, parsed.AggFunc)
 
 	// Determine query time range
 	var startTs, endTs int64
@@ -122,13 +118,64 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 		endTs = queryTime
 	}
 
-	// Filter series by name and labels (no string parsing needed!)
+	// Use index-based search if available
+	type IndexFinder interface {
+		FindSeriesByLabels(map[string]string) []uint64
+	}
+	type LabelsGetter interface {
+		GetLabelsForSeriesID(uint64) (storage.Labels, bool)
+	}
+
 	var result []QueryResult
-	for _, labels := range allSeries {
+	var matchingSeries []storage.Labels
+
+	if finder, ok := ph.tsdb.(IndexFinder); ok && parsed.MetricName != "" {
+		// Use inverted index to find matching series
+		// Even with just metric name, index helps narrow down from 500k to thousands
+		allMatchers := make(map[string]string)
+		allMatchers["__name__"] = parsed.MetricName
+		for k, v := range parsed.LabelMatchers {
+			allMatchers[k] = v
+		}
+
+		log.Printf("[INDEX] Using index search with matchers: %v", allMatchers)
+		seriesIDs := finder.FindSeriesByLabels(allMatchers)
+		log.Printf("[INDEX] Found %d matching series IDs", len(seriesIDs))
+
+		// Convert seriesIDs to Labels
+		if labelsGetter, ok := ph.tsdb.(LabelsGetter); ok {
+			for _, seriesID := range seriesIDs {
+				if labels, ok := labelsGetter.GetLabelsForSeriesID(seriesID); ok {
+					matchingSeries = append(matchingSeries, labels)
+				}
+			}
+		} else {
+			log.Printf("[INDEX] LabelsGetter not available, fallback to full scan")
+			allSeries, err := ph.tsdb.GetAllSeries()
+			if err != nil {
+				ph.sendError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			log.Printf("[INDEX] Full scan of %d series", len(allSeries))
+			matchingSeries = allSeries
+		}
+	} else {
+		log.Printf("[FULLSCAN] Index not available or no metric name, using full scan")
+		allSeries, err := ph.tsdb.GetAllSeries()
+		if err != nil {
+			ph.sendError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		log.Printf("[FULLSCAN] Scanning %d total series", len(allSeries))
+		matchingSeries = allSeries
+	}
+
+	// Filter series by name and labels
+	for _, labels := range matchingSeries {
 		if matchesLabels(labels, parsed.MetricName, parsed.LabelMatchers) {
 			// Format labels to metric key for DB lookup
 			metric := formatLabelsAsMetricString(labels)
-			
+
 			// Query TSDB for this specific metric
 			timestamps, values, err := ph.tsdb.Get(metric, startTs, endTs)
 			if err != nil {
@@ -181,7 +228,7 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	}
 
 	var query, startParam, endParam, stepParam string
-	
+
 	// Parse parameters based on request method
 	if r.Method == http.MethodPost {
 		// Parse form data from POST request
@@ -242,6 +289,8 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 
 	// Parse query with aggregation support
 	parsed := parsePromQL(query)
+	log.Printf("[PARSE] Query: %s => MetricName: %q, LabelMatchers: %v, AggFunc: %v",
+		query, parsed.MetricName, parsed.LabelMatchers, parsed.AggFunc)
 
 	// Check if this is a range vector function with step parameter
 	isRangeVectorFunc := parsed.AggFunc == AggRate || parsed.AggFunc == AggIrate ||
@@ -249,12 +298,12 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 		parsed.AggFunc == AggMinOverTime || parsed.AggFunc == AggMaxOverTime ||
 		parsed.AggFunc == AggCountOverTime || parsed.AggFunc == AggStddevOverTime ||
 		parsed.AggFunc == AggStdvarOverTime || parsed.AggFunc == AggQuantileOverTime
-	
+
 	if step > 0 && isRangeVectorFunc {
 		// Validate range vector is specified
 		if parsed.RangeVector <= 0 {
-			ph.sendError(w, http.StatusBadRequest, 
-				fmt.Sprintf("range vector duration required for %s function (e.g., %s(metric[5m]))", 
+			ph.sendError(w, http.StatusBadRequest,
+				fmt.Sprintf("range vector duration required for %s function (e.g., %s(metric[5m]))",
 					parsed.AggFunc, parsed.AggFunc))
 			return
 		}
@@ -266,20 +315,75 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Get all series (Labels) instead of formatted strings - much faster!
-	allSeries, err := ph.tsdb.GetAllSeries()
-	if err != nil {
-		ph.sendError(w, http.StatusInternalServerError, err.Error())
-		return
+	// Use index-based search if available (BadgerTSDB), otherwise fallback to full scan
+	type IndexFinder interface {
+		FindSeriesByLabels(map[string]string) []uint64
+	}
+	type LabelsGetter interface {
+		GetLabelsForSeriesID(uint64) (storage.Labels, bool)
 	}
 
-	// Filter series by name and labels (no string parsing needed!)
 	var result []QueryResult
-	for _, labels := range allSeries {
+	var matchingSeries []storage.Labels
+
+	log.Printf("[DEBUG-RANGE] TSDB type: %T, MetricName: %q", ph.tsdb, parsed.MetricName)
+	if finder, ok := ph.tsdb.(IndexFinder); ok && parsed.MetricName != "" {
+		log.Printf("[DEBUG-RANGE] IndexFinder type assertion successful")
+		// Use inverted index to find matching series
+		// Even with just metric name, index helps narrow down from 500k to thousands
+		allMatchers := make(map[string]string)
+		allMatchers["__name__"] = parsed.MetricName
+		for k, v := range parsed.LabelMatchers {
+			allMatchers[k] = v
+		}
+
+		log.Printf("[INDEX-RANGE] Using index search with matchers: %v", allMatchers)
+		seriesIDs := finder.FindSeriesByLabels(allMatchers)
+		log.Printf("[INDEX-RANGE] Found %d matching series IDs", len(seriesIDs))
+
+		// Convert seriesIDs to Labels
+		if labelsGetter, ok := ph.tsdb.(LabelsGetter); ok {
+			for _, seriesID := range seriesIDs {
+				if labels, ok := labelsGetter.GetLabelsForSeriesID(seriesID); ok {
+					matchingSeries = append(matchingSeries, labels)
+				}
+			}
+		} else {
+			// Fallback: get all series
+			log.Printf("[INDEX-RANGE] LabelsGetter not available, fallback to full scan")
+			allSeries, err := ph.tsdb.GetAllSeries()
+			if err != nil {
+				ph.sendError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			log.Printf("[INDEX-RANGE] Full scan of %d series", len(allSeries))
+			matchingSeries = allSeries
+		}
+	} else {
+		// Fallback: get all series and filter
+		if _, ok := ph.tsdb.(IndexFinder); !ok {
+			log.Printf("[FULLSCAN-RANGE] IndexFinder interface not implemented by %T", ph.tsdb)
+		} else if parsed.MetricName == "" {
+			log.Printf("[FULLSCAN-RANGE] MetricName is empty")
+		} else {
+			log.Printf("[FULLSCAN-RANGE] Unknown reason for fallback")
+		}
+		log.Printf("[FULLSCAN-RANGE] Index not available or no metric name, using full scan")
+		allSeries, err := ph.tsdb.GetAllSeries()
+		if err != nil {
+			ph.sendError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		log.Printf("[FULLSCAN-RANGE] Scanning %d total series", len(allSeries))
+		matchingSeries = allSeries
+	}
+
+	// Filter series by name and labels
+	for _, labels := range matchingSeries {
 		if matchesLabels(labels, parsed.MetricName, parsed.LabelMatchers) {
 			// Format labels to metric key for DB lookup
 			metric := formatLabelsAsMetricString(labels)
-			
+
 			// Query TSDB for this specific metric
 			timestamps, values, err := ph.tsdb.Get(metric, start, end)
 			if err != nil {
@@ -291,12 +395,12 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 				if step > 0 {
 					timestamps, values = downsampleByStep(timestamps, values, start, end, step)
 				}
-				
+
 				valuesArray := make([][]interface{}, len(values))
 				for i := range values {
 					valuesArray[i] = []interface{}{timestamps[i], fmt.Sprintf("%f", values[i])}
 				}
-				// Build tags map from labels (already parsed!)
+				// Build tags map from labels
 				parsedTags := make(map[string]string)
 				for _, label := range labels {
 					parsedTags[label.Name] = label.Value
@@ -320,10 +424,12 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 
 // WriteRequest represents a simplified remote write request
 type WriteRequest struct {
-	Metric string            `json:"metric"`
-	Value  float64           `json:"value"`
-	Time   int64             `json:"time,omitempty"`
-	Tags   map[string]string `json:"tags,omitempty"`
+	Metric    string            `json:"metric"`
+	Value     float64           `json:"value"`
+	Time      int64             `json:"time,omitempty"`
+	Timestamp int64             `json:"timestamp,omitempty"` // Alternative to Time
+	Tags      map[string]string `json:"tags,omitempty"`
+	Labels    map[string]string `json:"labels,omitempty"` // Alternative to Tags
 }
 
 // HandleWrite handles write requests: POST /api/v1/write
@@ -381,7 +487,7 @@ func (ph *PrometheusHandler) HandleBatchWrite(w http.ResponseWriter, r *http.Req
 	}
 
 	now := time.Now().Unix()
-	
+
 	// Convert to DataPoint slice for efficient batch processing
 	points := make([]storage.DataPoint, 0, len(requests))
 	for _, req := range requests {
@@ -392,12 +498,24 @@ func (ph *PrometheusHandler) HandleBatchWrite(w http.ResponseWriter, r *http.Req
 		// Use current time if not specified
 		timestamp := req.Time
 		if timestamp == 0 {
+			timestamp = req.Timestamp
+		}
+		if timestamp == 0 {
 			timestamp = now
 		}
 
+		// Merge Tags and Labels (Labels takes precedence)
+		allTags := make(map[string]string)
+		for k, v := range req.Tags {
+			allTags[k] = v
+		}
+		for k, v := range req.Labels {
+			allTags[k] = v
+		}
+
 		// Parse metric and tags into Labels
-		labels := buildLabels(req.Metric, req.Tags)
-		
+		labels := buildLabels(req.Metric, allTags)
+
 		points = append(points, storage.DataPoint{
 			Timestamp: timestamp,
 			Labels:    labels,
@@ -468,7 +586,7 @@ func buildMetricKey(name string, tags map[string]string) string {
 	for k, v := range tags {
 		sortedTags = append(sortedTags, fmt.Sprintf("%s=\"%s\"", k, v))
 	}
-	
+
 	// Simple sort (for consistency)
 	for i := 0; i < len(sortedTags); i++ {
 		for j := i + 1; j < len(sortedTags); j++ {
@@ -485,11 +603,11 @@ func buildMetricKey(name string, tags map[string]string) string {
 func buildLabels(name string, tags map[string]string) storage.Labels {
 	labels := make(storage.Labels, 0, len(tags)+1)
 	labels = append(labels, storage.Label{Name: "__name__", Value: name})
-	
+
 	for k, v := range tags {
 		labels = append(labels, storage.Label{Name: k, Value: v})
 	}
-	
+
 	// Sort for consistency using sort.Sort
 	sort.Sort(labels)
 	return labels
@@ -499,29 +617,29 @@ func buildLabels(name string, tags map[string]string) storage.Labels {
 // Format: metric_name{tag1="value1",tag2="value2"}
 func parseMetricKey(key string) (string, map[string]string) {
 	tags := make(map[string]string)
-	
+
 	// Find { position
 	bracePos := strings.Index(key, "{")
 	if bracePos < 0 {
 		// No tags
 		return key, tags
 	}
-	
+
 	name := key[:bracePos]
-	
+
 	// Find } position
 	endPos := strings.Index(key[bracePos:], "}")
 	if endPos < 0 {
 		return name, tags
 	}
 	endPos += bracePos
-	
+
 	// Parse tags
 	tagStr := key[bracePos+1 : endPos]
 	if tagStr == "" {
 		return name, tags
 	}
-	
+
 	// Split by comma (simple parser, doesn't handle escaped quotes)
 	pairs := strings.Split(tagStr, ",")
 	for _, pair := range pairs {
@@ -534,7 +652,7 @@ func parseMetricKey(key string) (string, map[string]string) {
 		v := strings.Trim(strings.TrimSpace(parts[1]), "\"")
 		tags[k] = v
 	}
-	
+
 	return name, tags
 }
 
@@ -550,7 +668,7 @@ func formatLabelsAsMetricString(labels storage.Labels) string {
 	if name == "" {
 		name = "unknown"
 	}
-	
+
 	// Collect non-name labels
 	var tagParts []string
 	for _, label := range labels {
@@ -558,11 +676,11 @@ func formatLabelsAsMetricString(labels storage.Labels) string {
 			tagParts = append(tagParts, fmt.Sprintf("%s=\"%s\"", label.Name, label.Value))
 		}
 	}
-	
+
 	if len(tagParts) == 0 {
 		return name
 	}
-	
+
 	return fmt.Sprintf("%s{%s}", name, strings.Join(tagParts, ","))
 }
 
@@ -575,14 +693,14 @@ func matchesLabels(labels storage.Labels, queryName string, labelMatchers map[st
 			return false
 		}
 	}
-	
+
 	// Check all label matchers
 	for k, v := range labelMatchers {
 		if labels.Get(k) != v {
 			return false
 		}
 	}
-	
+
 	return true
 }
 
@@ -590,19 +708,19 @@ func matchesLabels(labels storage.Labels, queryName string, labelMatchers map[st
 // Deprecated: Use matchesLabels for better performance
 func matchesQuery(metricKey string, queryName string, labelMatchers map[string]string) bool {
 	parsedName, parsedTags := parseMetricKey(metricKey)
-	
+
 	// Check name match (empty query name matches all)
 	if queryName != "" && parsedName != queryName {
 		return false
 	}
-	
+
 	// Check all label matchers
 	for k, v := range labelMatchers {
 		if parsedTags[k] != v {
 			return false
 		}
 	}
-	
+
 	return true
 }
 
@@ -625,7 +743,7 @@ func downsampleByStep(timestamps []int64, values []float64, start, end, step int
 		// This matches Prometheus behavior for consistent results
 		bestIdx := -1
 		bestTs := int64(0)
-		
+
 		for i, ts := range timestamps {
 			// Only consider timestamps at or before evalTime
 			if ts <= evalTime {
@@ -636,10 +754,10 @@ func downsampleByStep(timestamps []int64, values []float64, start, end, step int
 				}
 			}
 		}
-		
+
 		// Only include the value if it's within lookback delta
 		// This prevents stale values from being repeated when data is missing
-		if bestIdx >= 0 && (evalTime - bestTs) <= lookbackDelta {
+		if bestIdx >= 0 && (evalTime-bestTs) <= lookbackDelta {
 			resultTimestamps = append(resultTimestamps, evalTime)
 			resultValues = append(resultValues, values[bestIdx])
 		}
@@ -686,7 +804,7 @@ func (ph *PrometheusHandler) evaluateRangeVectorWithStep(parsed ParsedQuery, sta
 		}
 
 		var valuesArray [][]interface{}
-		
+
 		for _, evalTime := range evaluationTimes {
 			// Get data in the range vector window before this evaluation time
 			rangeStart := evalTime - parsed.RangeVector
@@ -785,14 +903,14 @@ func (ph *PrometheusHandler) evaluateRangeVectorWithStep(parsed ParsedQuery, sta
 						sum += v
 					}
 					mean := sum / float64(len(values))
-					
+
 					variance := 0.0
 					for _, v := range values {
 						diff := v - mean
 						variance += diff * diff
 					}
 					variance /= float64(len(values))
-					
+
 					if parsed.AggFunc == AggStddevOverTime {
 						resultValue = math.Sqrt(variance)
 					} else {
@@ -817,7 +935,6 @@ func (ph *PrometheusHandler) evaluateRangeVectorWithStep(parsed ParsedQuery, sta
 
 	return results
 }
-
 
 func (ph *PrometheusHandler) sendSuccess(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -944,7 +1061,7 @@ func (ph *PrometheusHandler) HandleKrillQL(w http.ResponseWriter, r *http.Reques
 				Code:     fn.Code,
 				Module:   fn.Module,
 			}
-			
+
 			result, err := ProcessPipelineFunction(currentResult, fn.Name, fnStage)
 			if err != nil {
 				ph.sendError(w, http.StatusBadRequest, fmt.Sprintf("error in function[%d]: %s", i, err.Error()))
@@ -957,13 +1074,13 @@ func (ph *PrometheusHandler) HandleKrillQL(w http.ResponseWriter, r *http.Reques
 	// Process remaining stages as pipeline functions
 	for i := 1; i < len(req.Queries); i++ {
 		stage := req.Queries[i]
-		
+
 		// Must be a function stage
 		if stage.Function == "" {
 			ph.sendError(w, http.StatusBadRequest, fmt.Sprintf("stage %d must specify a function", i))
 			return
 		}
-		
+
 		// Process function using external function handler
 		result, err := ProcessPipelineFunction(currentResult, stage.Function, stage)
 		if err != nil {

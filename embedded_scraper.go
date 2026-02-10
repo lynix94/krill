@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -148,21 +149,21 @@ func (es *EmbeddedScraper) scrapeTarget(config scraper.ScrapeConfig, staticConfi
 
 	// Direct write to TSDB (NO HTTP/JSON overhead!)
 	now := time.Now().Unix()
-	
+
 	// Build batch of DataPoints for direct TSDB write
 	points := make([]storage.DataPoint, 0, len(metrics))
-	
+
 	for _, metric := range metrics {
 		// Build labels directly
 		labels := make(storage.Labels, 0, len(metric.Labels)+len(config.Labels)+len(staticConfig.Labels)+2)
-		
+
 		// Metric name
 		metricName := metric.Name
 		if config.MetricPrefix != "" {
 			metricName = config.MetricPrefix + "." + metricName
 		}
 		labels = append(labels, storage.Label{Name: "__name__", Value: metricName})
-		
+
 		// Add all labels
 		for k, v := range config.Labels {
 			labels = append(labels, storage.Label{Name: k, Value: v})
@@ -173,11 +174,13 @@ func (es *EmbeddedScraper) scrapeTarget(config scraper.ScrapeConfig, staticConfi
 		for k, v := range metric.Labels {
 			labels = append(labels, storage.Label{Name: k, Value: v})
 		}
-		
 		// Add job and instance
 		labels = append(labels, storage.Label{Name: "job", Value: config.JobName})
 		labels = append(labels, storage.Label{Name: "instance", Value: target})
-		
+
+		// IMPORTANT: Sort labels for consistent hashing and key generation
+		sort.Sort(labels)
+
 		// Use metric timestamp if available
 		timestamp := metric.Timestamp
 		if timestamp == 0 {
@@ -185,7 +188,7 @@ func (es *EmbeddedScraper) scrapeTarget(config scraper.ScrapeConfig, staticConfi
 		} else if timestamp > 9999999999 {
 			timestamp = timestamp / 1000
 		}
-		
+
 		points = append(points, storage.DataPoint{
 			Timestamp: timestamp,
 			Labels:    labels,

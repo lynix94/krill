@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strings"
@@ -17,15 +18,20 @@ import (
 
 // BadgerTSDB is a persistent time-series database using BadgerDB
 type BadgerTSDB struct {
-	db                *badger.DB
-	ttl               time.Duration
-	labels            map[uint64]storage.Labels // seriesID -> labels mapping
-	labelsMu          sync.RWMutex              // Protects labels map
-	formattedMetrics  map[uint64]string         // seriesID -> formatted metric string cache
-	metricsCache      []string                  // cached GetMetrics() result
-	metricsCacheTime  time.Time                 // last cache update time
-	metricsCacheMu    sync.RWMutex              // Protects metrics cache
-	metricsCacheTTL   time.Duration             // cache TTL (default 5 minutes)
+	db               *badger.DB
+	ttl              time.Duration
+	labels           map[uint64]storage.Labels // seriesID -> labels mapping
+	labelsMu         sync.RWMutex              // Protects labels map
+	formattedMetrics map[uint64]string         // seriesID -> formatted metric string cache
+	metricsCache     []string                  // cached GetMetrics() result
+	metricsCacheTime time.Time                 // last cache update time
+	metricsCacheMu   sync.RWMutex              // Protects metrics cache
+	metricsCacheTTL  time.Duration             // cache TTL (default 5 minutes)
+
+	// Inverted index: labelName -> labelValue -> []seriesID
+	// Example: labelIndex["cpu"]["cpu0"] = [seriesID1, seriesID3, ...]
+	labelIndex   map[string]map[string][]uint64
+	labelIndexMu sync.RWMutex
 }
 
 // BadgerOptions contains configuration for BadgerTSDB
@@ -55,6 +61,7 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 		labels:           make(map[uint64]storage.Labels),
 		formattedMetrics: make(map[uint64]string),
 		metricsCacheTTL:  5 * time.Minute, // 5 minutes cache
+		labelIndex:       make(map[string]map[string][]uint64),
 	}
 
 	// Load all series labels from database
@@ -69,24 +76,34 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 // PutLabels stores a time-series data point with Gorilla compression using Labels
 func (bdb *BadgerTSDB) PutLabels(ts int64, labels storage.Labels, value float64) error {
 	seriesID := labels.Hash()
-	
+
+	// Check if this is a new series
+	bdb.labelsMu.RLock()
+	_, exists := bdb.labels[seriesID]
+	bdb.labelsMu.RUnlock()
+
 	// Store labels mapping in memory with proper locking
 	bdb.labelsMu.Lock()
 	bdb.labels[seriesID] = labels.Copy()
 	// Cache the formatted metric string
 	bdb.formattedMetrics[seriesID] = formatLabelsAsMetricString(labels)
 	bdb.labelsMu.Unlock()
-	
+
+	// Update inverted index for new series
+	if !exists {
+		bdb.updateLabelIndex(seriesID, labels)
+	}
+
 	// Invalidate GetMetrics cache when new series is added
 	bdb.metricsCacheMu.Lock()
 	bdb.metricsCache = nil
 	bdb.metricsCacheMu.Unlock()
-	
+
 	// Store labels metadata in BadgerDB for persistence
 	if err := bdb.storeLabelsMetadata(seriesID, labels); err != nil {
 		return fmt.Errorf("failed to store labels metadata: %w", err)
 	}
-	
+
 	// Create time-partitioned key: seriesID:timestamp_bucket
 	// Use hourly buckets for better read performance
 	bucket := ts / 3600 * 3600
@@ -95,10 +112,10 @@ func (bdb *BadgerTSDB) PutLabels(ts int64, labels storage.Labels, value float64)
 	return bdb.db.Update(func(txn *badger.Txn) error {
 		// Get existing series for this bucket
 		item, err := txn.Get(key)
-		
+
 		var existingTimestamps []int64
 		var existingValues []float64
-		
+
 		if err == nil {
 			// Deserialize and decode existing series
 			err = item.Value(func(val []byte) error {
@@ -176,19 +193,19 @@ func (bdb *BadgerTSDB) TsdbPut(ts int64, metric string, value float64) error {
 func (bdb *BadgerTSDB) TsdbPutBatch(points []storage.DataPoint) error {
 	// Split large batches into chunks to avoid "Txn is too big" error
 	const maxChunkSize = 1000 // Process 1000 points per transaction
-	
+
 	for i := 0; i < len(points); i += maxChunkSize {
 		end := i + maxChunkSize
 		if end > len(points) {
 			end = len(points)
 		}
 		chunk := points[i:end]
-		
+
 		if err := bdb.writeBatchChunk(chunk); err != nil {
 			return err
 		}
 	}
-	
+
 	return nil
 }
 
@@ -200,7 +217,10 @@ func (bdb *BadgerTSDB) writeBatchChunk(points []storage.DataPoint) error {
 		bucket   int64
 	}
 	bucketPoints := make(map[bucketKey][]storage.DataPoint)
-	
+
+	// Track new series for index updates
+	newSeries := make(map[uint64]storage.Labels)
+
 	// Store labels with proper locking
 	bdb.labelsMu.Lock()
 	for _, point := range points {
@@ -208,107 +228,140 @@ func (bdb *BadgerTSDB) writeBatchChunk(points []storage.DataPoint) error {
 		bucket := point.Timestamp / 3600 * 3600
 		key := bucketKey{seriesID, bucket}
 		bucketPoints[key] = append(bucketPoints[key], point)
-		
+
+		// Check if new series
+		if _, exists := bdb.labels[seriesID]; !exists {
+			newSeries[seriesID] = point.Labels.Copy()
+		}
+
 		// Store labels mapping (already holding lock)
 		bdb.labels[seriesID] = point.Labels.Copy()
 		bdb.formattedMetrics[seriesID] = formatLabelsAsMetricString(point.Labels)
 	}
 	bdb.labelsMu.Unlock()
-	
+
+	// Update index for new series
+	for seriesID, labels := range newSeries {
+		bdb.updateLabelIndex(seriesID, labels)
+	}
+
 	// Invalidate cache
 	bdb.metricsCacheMu.Lock()
 	bdb.metricsCache = nil
 	bdb.metricsCacheMu.Unlock()
-	
+
 	// Store labels metadata (need to read labels again with lock)
 	labelsSeen := make(map[uint64]bool)
 	for key := range bucketPoints {
 		if !labelsSeen[key.seriesID] {
 			labelsSeen[key.seriesID] = true
-			
+
 			bdb.labelsMu.RLock()
 			labels := bdb.labels[key.seriesID]
 			bdb.labelsMu.RUnlock()
-			
+
 			if err := bdb.storeLabelsMetadata(key.seriesID, labels); err != nil {
 				return fmt.Errorf("failed to store labels metadata: %w", err)
 			}
 		}
 	}
-	
-	// Batch write all points
-	return bdb.db.Update(func(txn *badger.Txn) error {
-		for bKey, points := range bucketPoints {
-			key := makeKeyFromID(bKey.seriesID, bKey.bucket)
-			
-			// Get existing series for this bucket
-			var existingTimestamps []int64
-			var existingValues []float64
-			
-			item, err := txn.Get(key)
-			if err == nil {
-				err = item.Value(func(val []byte) error {
-					series, err := DeserializeSeriesBlock(val)
+
+	// Batch write all points with retry logic for transaction conflicts
+	maxRetries := 3
+	var lastErr error
+	for retry := 0; retry < maxRetries; retry++ {
+		lastErr = bdb.db.Update(func(txn *badger.Txn) error {
+			for bKey, points := range bucketPoints {
+				key := makeKeyFromID(bKey.seriesID, bKey.bucket)
+
+				// Get existing series for this bucket
+				var existingTimestamps []int64
+				var existingValues []float64
+
+				item, err := txn.Get(key)
+				if err == nil {
+					err = item.Value(func(val []byte) error {
+						series, err := DeserializeSeriesBlock(val)
+						if err != nil {
+							return err
+						}
+						existingTimestamps, existingValues, err = series.Decode()
+						return err
+					})
 					if err != nil {
 						return err
 					}
-					existingTimestamps, existingValues, err = series.Decode()
+				} else if err != badger.ErrKeyNotFound {
 					return err
-				})
+				}
+
+				// Add new points
+				for _, point := range points {
+					if len(existingTimestamps) > 0 {
+						lastTs := existingTimestamps[len(existingTimestamps)-1]
+						if point.Timestamp < lastTs {
+							continue
+						}
+						if point.Timestamp == lastTs {
+							continue
+						}
+					}
+					existingTimestamps = append(existingTimestamps, point.Timestamp)
+					existingValues = append(existingValues, point.Value)
+				}
+
+				// Create new series block
+				series := &SeriesBlock{
+					SeriesID:         bKey.seriesID,
+					StartTimestamp:   bKey.bucket,
+					timestampEncoder: gorilla.NewTimestampEncoder(),
+					valueEncoder:     gorilla.NewValueEncoder(),
+				}
+
+				// Encode all points
+				for i, timestamp := range existingTimestamps {
+					if err := series.AddPoint(timestamp, existingValues[i]); err != nil {
+						return err
+					}
+				}
+
+				// Serialize and store
+				data, err := series.Serialize()
 				if err != nil {
 					return err
 				}
-			} else if err != badger.ErrKeyNotFound {
-				return err
-			}
-			
-			// Add new points
-			for _, point := range points {
-				if len(existingTimestamps) > 0 {
-					lastTs := existingTimestamps[len(existingTimestamps)-1]
-					if point.Timestamp < lastTs {
-						continue
-					}
-					if point.Timestamp == lastTs {
-						continue
-					}
+
+				entry := badger.NewEntry(key, data)
+				if bdb.ttl > 0 {
+					entry = entry.WithTTL(bdb.ttl)
 				}
-				existingTimestamps = append(existingTimestamps, point.Timestamp)
-				existingValues = append(existingValues, point.Value)
-			}
-			
-			// Create new series block
-			series := &SeriesBlock{
-				SeriesID:         bKey.seriesID,
-				StartTimestamp:   bKey.bucket,
-				timestampEncoder: gorilla.NewTimestampEncoder(),
-				valueEncoder:     gorilla.NewValueEncoder(),
-			}
-			
-			// Encode all points
-			for i, timestamp := range existingTimestamps {
-				if err := series.AddPoint(timestamp, existingValues[i]); err != nil {
+
+				if err := txn.SetEntry(entry); err != nil {
 					return err
 				}
 			}
-			
-			// Serialize and store
-			data, err := series.Serialize()
-			if err != nil {
-				return err
-			}
-			
-			entry := badger.NewEntry(key, data)
-			if bdb.ttl > 0 {
-				entry = entry.WithTTL(bdb.ttl)
-			}
-			
-			if err := txn.SetEntry(entry); err != nil {
-				return err
+			return nil
+		})
+
+		// Check if we should retry
+		if lastErr == nil {
+			return nil
+		}
+
+		// Only retry on transaction conflict
+		if lastErr == badger.ErrConflict {
+			if retry < maxRetries-1 {
+				// Small delay before retry
+				time.Sleep(time.Millisecond * time.Duration(10*(retry+1)))
+				continue
 			}
 		}
-		return nil
-	})
+
+		// Non-conflict error or max retries reached
+		break
+	}
+
+	return lastErr
 }
 
 // PutBatch implements Storage interface batch write
@@ -420,6 +473,284 @@ func (bdb *BadgerTSDB) GetAllSeries() ([]storage.Labels, error) {
 	return result, nil
 }
 
+// updateLabelIndex updates the inverted index when a new series is added
+// Persists to disk immediately for consistency
+func (bdb *BadgerTSDB) updateLabelIndex(seriesID uint64, labels storage.Labels) {
+	bdb.labelIndexMu.Lock()
+	defer bdb.labelIndexMu.Unlock()
+
+	// Batch all index updates for this series
+	wb := bdb.db.NewWriteBatch()
+	defer wb.Cancel()
+
+	for _, label := range labels {
+		// Create label name map if not exists
+		if bdb.labelIndex[label.Name] == nil {
+			bdb.labelIndex[label.Name] = make(map[string][]uint64)
+		}
+
+		// Add seriesID to posting list
+		posting := bdb.labelIndex[label.Name][label.Value]
+		// Check if already exists
+		alreadyExists := false
+		for _, id := range posting {
+			if id == seriesID {
+				alreadyExists = true
+				break
+			}
+		}
+
+		if !alreadyExists {
+			bdb.labelIndex[label.Name][label.Value] = append(posting, seriesID)
+
+			// Persist this posting list to disk
+			key := fmt.Sprintf("idx:%s:%s", label.Name, label.Value)
+			buf := make([]byte, len(bdb.labelIndex[label.Name][label.Value])*8)
+			for i, id := range bdb.labelIndex[label.Name][label.Value] {
+				binary.BigEndian.PutUint64(buf[i*8:], id)
+			}
+
+			if err := wb.Set([]byte(key), buf); err != nil {
+				log.Printf("[BADGER-INDEX] Warning: failed to add index entry to batch: %v", err)
+			}
+		}
+	}
+
+	// Flush all index updates for this series
+	if err := wb.Flush(); err != nil {
+		log.Printf("[BADGER-INDEX] Warning: failed to persist index updates: %v", err)
+	}
+}
+
+// updateLabelIndexBulk is used during initial index building (without DB persistence)
+func (bdb *BadgerTSDB) updateLabelIndexBulk(seriesID uint64, labels storage.Labels) {
+	bdb.labelIndexMu.Lock()
+	defer bdb.labelIndexMu.Unlock()
+
+	for _, label := range labels {
+		// Create label name map if not exists
+		if bdb.labelIndex[label.Name] == nil {
+			bdb.labelIndex[label.Name] = make(map[string][]uint64)
+		}
+
+		// Add seriesID to posting list (no duplicate check for performance)
+		bdb.labelIndex[label.Name][label.Value] = append(
+			bdb.labelIndex[label.Name][label.Value],
+			seriesID,
+		)
+	}
+}
+
+// saveIndexEntryToDB persists a single posting list to BadgerDB (deprecated)
+func (bdb *BadgerTSDB) saveIndexEntryToDB(labelName, labelValue string, seriesIDs []uint64) {
+	key := fmt.Sprintf("idx:%s:%s", labelName, labelValue)
+
+	// Serialize seriesIDs
+	buf := make([]byte, len(seriesIDs)*8)
+	for i, id := range seriesIDs {
+		binary.BigEndian.PutUint64(buf[i*8:], id)
+	}
+
+	err := bdb.db.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte(key), buf)
+	})
+
+	if err != nil {
+		log.Printf("[BADGER-INDEX] Warning: failed to persist index entry %s=%s: %v", labelName, labelValue, err)
+	}
+}
+
+// persistEntireIndex saves the entire inverted index to BadgerDB in batches
+func (bdb *BadgerTSDB) persistEntireIndex() error {
+	bdb.labelIndexMu.RLock()
+	defer bdb.labelIndexMu.RUnlock()
+
+	wb := bdb.db.NewWriteBatch()
+	defer wb.Cancel()
+
+	count := 0
+	for labelName, valueMap := range bdb.labelIndex {
+		for labelValue, seriesIDs := range valueMap {
+			key := fmt.Sprintf("idx:%s:%s", labelName, labelValue)
+			buf := make([]byte, len(seriesIDs)*8)
+			for i, id := range seriesIDs {
+				binary.BigEndian.PutUint64(buf[i*8:], id)
+			}
+
+			if err := wb.Set([]byte(key), buf); err != nil {
+				return err
+			}
+
+			count++
+			if count%10000 == 0 {
+				if err := wb.Flush(); err != nil {
+					return err
+				}
+				wb = bdb.db.NewWriteBatch()
+			}
+		}
+	}
+
+	return wb.Flush()
+}
+
+// loadIndexFromDB loads the entire inverted index from BadgerDB
+func (bdb *BadgerTSDB) loadIndexFromDB() error {
+	log.Printf("[BADGER-INDEX] Loading inverted index from disk...")
+
+	bdb.labelIndexMu.Lock()
+	defer bdb.labelIndexMu.Unlock()
+
+	bdb.labelIndex = make(map[string]map[string][]uint64)
+
+	err := bdb.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = []byte("idx:")
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		count := 0
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := string(item.Key())
+
+			// Parse key: "idx:labelName:labelValue"
+			parts := strings.SplitN(key, ":", 3)
+			if len(parts) != 3 {
+				continue
+			}
+			labelName := parts[1]
+			labelValue := parts[2]
+
+			// Deserialize seriesIDs
+			err := item.Value(func(val []byte) error {
+				if len(val)%8 != 0 {
+					return fmt.Errorf("invalid posting list size")
+				}
+
+				seriesIDs := make([]uint64, len(val)/8)
+				for i := 0; i < len(seriesIDs); i++ {
+					seriesIDs[i] = binary.BigEndian.Uint64(val[i*8:])
+				}
+
+				// Add to index
+				if bdb.labelIndex[labelName] == nil {
+					bdb.labelIndex[labelName] = make(map[string][]uint64)
+				}
+				bdb.labelIndex[labelName][labelValue] = seriesIDs
+				count++
+
+				return nil
+			})
+
+			if err != nil {
+				log.Printf("[BADGER-INDEX] Warning: failed to load index entry %s=%s: %v", labelName, labelValue, err)
+			}
+		}
+
+		log.Printf("[BADGER-INDEX] Loaded %d posting lists from disk", count)
+		return nil
+	})
+
+	return err
+}
+
+// FindSeriesByLabels finds series IDs matching the given label matchers using inverted index
+// Returns slice of seriesIDs that match ALL label conditions (AND operation)
+func (bdb *BadgerTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uint64 {
+	if len(labelMatchers) == 0 {
+		return nil
+	}
+
+	bdb.labelIndexMu.RLock()
+	defer bdb.labelIndexMu.RUnlock()
+
+	log.Printf("[BADGER-INDEX] Searching with matchers: %v", labelMatchers)
+	log.Printf("[BADGER-INDEX] Index has %d label names", len(bdb.labelIndex))
+
+	// Find the smallest posting list to start with (optimization)
+	var smallestPosting []uint64
+	smallestSize := -1
+
+	for labelName, labelValue := range labelMatchers {
+		if valueMap, ok := bdb.labelIndex[labelName]; ok {
+			log.Printf("[BADGER-INDEX] Label %q has %d values", labelName, len(valueMap))
+			if posting, ok := valueMap[labelValue]; ok {
+				log.Printf("[BADGER-INDEX] Label %q=%q has %d series", labelName, labelValue, len(posting))
+				if smallestSize == -1 || len(posting) < smallestSize {
+					smallestPosting = posting
+					smallestSize = len(posting)
+				}
+			} else {
+				// Label value not found - no matches
+				log.Printf("[BADGER-INDEX] Label value %q not found for label %q", labelValue, labelName)
+				return nil
+			}
+		} else {
+			// Label name not found - no matches
+			log.Printf("[BADGER-INDEX] Label name %q not found in index", labelName)
+			return nil
+		}
+	}
+
+	if smallestPosting == nil {
+		return nil
+	}
+
+	// If only one matcher, return the posting list
+	if len(labelMatchers) == 1 {
+		result := make([]uint64, len(smallestPosting))
+		copy(result, smallestPosting)
+		return result
+	}
+
+	// Intersect with other posting lists
+	// Convert smallest to map for O(1) lookup
+	candidates := make(map[uint64]bool, len(smallestPosting))
+	for _, id := range smallestPosting {
+		candidates[id] = true
+	}
+
+	// Check each candidate against all other matchers
+	bdb.labelsMu.RLock()
+	defer bdb.labelsMu.RUnlock()
+
+	var result []uint64
+	for seriesID := range candidates {
+		labels, ok := bdb.labels[seriesID]
+		if !ok {
+			continue
+		}
+
+		// Check if all label matchers match
+		match := true
+		for name, value := range labelMatchers {
+			if labels.Get(name) != value {
+				match = false
+				break
+			}
+		}
+
+		if match {
+			result = append(result, seriesID)
+		}
+	}
+
+	return result
+}
+
+// GetLabelsForSeriesID returns the labels for a specific series ID
+func (bdb *BadgerTSDB) GetLabelsForSeriesID(seriesID uint64) (storage.Labels, bool) {
+	bdb.labelsMu.RLock()
+	defer bdb.labelsMu.RUnlock()
+
+	labels, ok := bdb.labels[seriesID]
+	if !ok {
+		return nil, false
+	}
+	return labels.Copy(), true
+}
+
 // GetMetrics returns all metric names (legacy API, returns formatted strings)
 func (bdb *BadgerTSDB) GetMetrics() ([]string, error) {
 	// Check cache first
@@ -476,7 +807,7 @@ func (bdb *BadgerTSDB) RunGC() error {
 func (bdb *BadgerTSDB) loadAllSeries() error {
 	var skippedCount int
 	var loadedCount int
-	
+
 	err := bdb.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = true
@@ -489,13 +820,13 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			key := item.Key()
-			
+
 			// Extract seriesID from key "meta:seriesID"
 			if len(key) < 13 { // "meta:" (5 bytes) + uint64 (8 bytes)
 				continue
 			}
 			seriesID := binary.BigEndian.Uint64(key[5:])
-			
+
 			// Read labels from value
 			err := item.Value(func(val []byte) error {
 				// Skip empty values
@@ -529,17 +860,48 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 			bdb.formattedMetrics[seriesID] = formatLabelsAsMetricString(labels)
 		}
 		bdb.labelsMu.Unlock()
+
 		return nil
 	})
-	
+
 	if err != nil {
 		return err
 	}
-	
+
+	// Try to load persisted index first
+	if err := bdb.loadIndexFromDB(); err != nil {
+		log.Printf("[BADGER-INDEX] No persisted index found, building from scratch...")
+
+		// Build inverted index from loaded series (without persisting each update)
+		log.Printf("[BADGER-INDEX] Building inverted index from %d series...", len(bdb.labels))
+		count := 0
+		progressInterval := 100000 // Log every 100k series
+		for seriesID, labels := range bdb.labels {
+			bdb.updateLabelIndexBulk(seriesID, labels)
+			count++
+			if count%progressInterval == 0 {
+				log.Printf("[BADGER-INDEX] Progress: %d/%d series indexed (%.1f%%)",
+					count, len(bdb.labels), float64(count)*100.0/float64(len(bdb.labels)))
+			}
+		}
+		log.Printf("[BADGER-INDEX] Index build complete: %d series, %d label names",
+			len(bdb.labels), len(bdb.labelIndex))
+
+		// Now persist the entire index in one go
+		log.Printf("[BADGER-INDEX] Persisting index to disk...")
+		if err := bdb.persistEntireIndex(); err != nil {
+			log.Printf("[BADGER-INDEX] Warning: failed to persist index: %v", err)
+		} else {
+			log.Printf("[BADGER-INDEX] Index persisted successfully")
+		}
+	} else {
+		log.Printf("[BADGER-INDEX] Successfully loaded persisted index with %d label names", len(bdb.labelIndex))
+	}
+
 	if skippedCount > 0 {
 		fmt.Printf("Loaded %d series, skipped %d corrupted series\n", loadedCount, skippedCount)
 	}
-	
+
 	return nil
 }
 
@@ -563,21 +925,21 @@ func makeMetadataKey(seriesID uint64) []byte {
 // serializeLabels serializes labels to bytes
 func serializeLabels(labels storage.Labels) []byte {
 	buf := new(bytes.Buffer)
-	
+
 	// Write number of labels
 	binary.Write(buf, binary.BigEndian, uint32(len(labels)))
-	
+
 	// Write each label
 	for _, label := range labels {
 		// Write name length and name
 		binary.Write(buf, binary.BigEndian, uint32(len(label.Name)))
 		buf.Write([]byte(label.Name))
-		
+
 		// Write value length and value
 		binary.Write(buf, binary.BigEndian, uint32(len(label.Value)))
 		buf.Write([]byte(label.Value))
 	}
-	
+
 	return buf.Bytes()
 }
 
@@ -586,17 +948,17 @@ func deserializeLabels(data []byte) (storage.Labels, error) {
 	if len(data) == 0 {
 		return storage.Labels{}, nil
 	}
-	
+
 	buf := bytes.NewReader(data)
-	
+
 	// Read number of labels
 	var count uint32
 	if err := binary.Read(buf, binary.BigEndian, &count); err != nil {
 		return nil, fmt.Errorf("failed to read label count: %w", err)
 	}
-	
+
 	labels := make(storage.Labels, count)
-	
+
 	// Read each label
 	for i := uint32(0); i < count; i++ {
 		// Read name
@@ -608,7 +970,7 @@ func deserializeLabels(data []byte) (storage.Labels, error) {
 		if _, err := buf.Read(nameBuf); err != nil {
 			return nil, fmt.Errorf("failed to read label[%d] name: %w", i, err)
 		}
-		
+
 		// Read value
 		var valueLen uint32
 		if err := binary.Read(buf, binary.BigEndian, &valueLen); err != nil {
@@ -618,13 +980,13 @@ func deserializeLabels(data []byte) (storage.Labels, error) {
 		if _, err := buf.Read(valueBuf); err != nil {
 			return nil, fmt.Errorf("failed to read label[%d] value: %w", i, err)
 		}
-		
+
 		labels[i] = storage.Label{
 			Name:  string(nameBuf),
 			Value: string(valueBuf),
 		}
 	}
-	
+
 	return labels, nil
 }
 
@@ -772,7 +1134,7 @@ func (sb *SeriesBlock) Decode() ([]int64, []float64, error) {
 			sb.timestampBytes = sb.timestampEncoder.Bytes()
 			sb.valueBytes = sb.valueEncoder.Bytes()
 		}
-		
+
 		if len(sb.timestampBytes) == 0 || len(sb.valueBytes) == 0 {
 			// No compressed data available, return just the first value
 			return timestamps, values, nil
@@ -837,23 +1199,23 @@ func extractMetricFromKey(key []byte) string {
 func parseMetricString(metric string) storage.Labels {
 	// Find the opening brace
 	braceIdx := strings.Index(metric, "{")
-	
+
 	var name string
 	var labels storage.Labels
-	
+
 	if braceIdx == -1 {
 		// No tags, just metric name
 		name = metric
 	} else {
 		// Extract metric name
 		name = metric[:braceIdx]
-		
+
 		// Extract tags
 		tagsStr := metric[braceIdx+1:]
 		if len(tagsStr) > 0 && tagsStr[len(tagsStr)-1] == '}' {
 			tagsStr = tagsStr[:len(tagsStr)-1]
 		}
-		
+
 		// Parse tags
 		tags := splitTags(tagsStr)
 		labels = make(storage.Labels, 0, len(tags)+1)
@@ -861,11 +1223,11 @@ func parseMetricString(metric string) storage.Labels {
 			labels = append(labels, storage.Label{Name: key, Value: value})
 		}
 	}
-	
+
 	// Always add __name__ label
 	labels = append(labels, storage.Label{Name: "__name__", Value: name})
 	sort.Sort(labels)
-	
+
 	return labels
 }
 
@@ -875,7 +1237,7 @@ func splitTags(tagsStr string) map[string]string {
 	if tagsStr == "" {
 		return tags
 	}
-	
+
 	// Simple parser for key="value" pairs
 	parts := strings.Split(tagsStr, ",")
 	for _, part := range parts {
@@ -884,18 +1246,18 @@ func splitTags(tagsStr string) map[string]string {
 		if eqIdx == -1 {
 			continue
 		}
-		
+
 		key := strings.TrimSpace(part[:eqIdx])
 		value := strings.TrimSpace(part[eqIdx+1:])
-		
+
 		// Remove quotes from value
 		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
 			value = value[1 : len(value)-1]
 		}
-		
+
 		tags[key] = value
 	}
-	
+
 	return tags
 }
 
@@ -905,7 +1267,7 @@ func formatLabelsAsMetricString(labels storage.Labels) string {
 	if name == "" {
 		name = "unknown"
 	}
-	
+
 	// Collect non-name labels
 	var tagParts []string
 	for _, label := range labels {
@@ -913,10 +1275,10 @@ func formatLabelsAsMetricString(labels storage.Labels) string {
 			tagParts = append(tagParts, fmt.Sprintf("%s=\"%s\"", label.Name, label.Value))
 		}
 	}
-	
+
 	if len(tagParts) == 0 {
 		return name
 	}
-	
+
 	return fmt.Sprintf("%s{%s}", name, strings.Join(tagParts, ","))
 }
