@@ -3,6 +3,7 @@ package memory
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/lynix/krill/storage"
 	"github.com/lynix/krill/storage/gorilla"
@@ -13,6 +14,11 @@ type MemoryStorage struct {
 	mu      sync.RWMutex
 	series  map[uint64]*MetricSeries  // seriesID -> series
 	labels  map[uint64]storage.Labels // seriesID -> labels
+	
+	// Cache for GetMetrics to avoid repeated formatting
+	metricsCache     []string
+	metricsCacheTime time.Time
+	metricsCacheMu   sync.RWMutex
 }
 
 // MetricSeries stores compressed time-series data for a single metric
@@ -99,6 +105,11 @@ func (ms *MemoryStorage) PutBatch(points []storage.DataPoint) error {
 		series.mu.Unlock()
 	}
 	
+	// Invalidate metrics cache
+	ms.metricsCacheMu.Lock()
+	ms.metricsCache = nil
+	ms.metricsCacheMu.Unlock()
+	
 	return nil
 }
 
@@ -116,6 +127,11 @@ func (ms *MemoryStorage) PutLabels(ts int64, labels storage.Labels, value float6
 		}
 		ms.series[seriesID] = series
 		ms.labels[seriesID] = labels.Copy()
+		
+		// Invalidate metrics cache when new series added
+		ms.metricsCacheMu.Lock()
+		ms.metricsCache = nil
+		ms.metricsCacheMu.Unlock()
 	}
 	ms.mu.Unlock()
 
@@ -242,14 +258,31 @@ func (ms *MemoryStorage) GetLabels(labels storage.Labels, startTs, endTs int64) 
 
 // GetMetrics returns all metric names (as formatted strings for backward compatibility)
 func (ms *MemoryStorage) GetMetrics() ([]string, error) {
-	ms.mu.RLock()
-	defer ms.mu.RUnlock()
+	// Check cache first (5 minute TTL)
+	ms.metricsCacheMu.RLock()
+	if ms.metricsCache != nil && time.Since(ms.metricsCacheTime) < 5*time.Minute {
+		result := make([]string, len(ms.metricsCache))
+		copy(result, ms.metricsCache)
+		ms.metricsCacheMu.RUnlock()
+		return result, nil
+	}
+	ms.metricsCacheMu.RUnlock()
 
+	// Cache miss or expired, rebuild
+	ms.mu.RLock()
 	metrics := make([]string, 0, len(ms.series))
 	for seriesID := range ms.series {
 		labels := ms.labels[seriesID]
 		metrics = append(metrics, formatLabelsAsMetricString(labels))
 	}
+	ms.mu.RUnlock()
+	
+	// Update cache
+	ms.metricsCacheMu.Lock()
+	ms.metricsCache = metrics
+	ms.metricsCacheTime = time.Now()
+	ms.metricsCacheMu.Unlock()
+	
 	return metrics, nil
 }
 

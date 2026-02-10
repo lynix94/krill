@@ -629,6 +629,9 @@ const dashboardHTML = `<!DOCTYPE html>
             const outputPre = document.getElementById('queryOutput');
             const chartContainer = document.getElementById('chartContainer');
             
+            // Start timing
+            const startTime = performance.now();
+            
             try {
                 let response, data;
                 
@@ -636,9 +639,13 @@ const dashboardHTML = `<!DOCTYPE html>
                     response = await fetch('/api/v1/query?query=' + encodeURIComponent(metric));
                     data = await response.json();
                     
+                    const endTime = performance.now();
+                    const responseTime = (endTime - startTime).toFixed(2);
+                    
                     resultDiv.style.display = 'block';
                     chartContainer.style.display = 'none';
-                    outputPre.textContent = JSON.stringify(data, null, 2);
+                    outputPre.innerHTML = '<strong style="color: #667eea;">⏱️ Response Time: ' + responseTime + ' ms</strong>\n\n' + 
+                                          JSON.stringify(data, null, 2);
                 } else {
                     const startInput = document.getElementById('startTime').value;
                     const endInput = document.getElementById('endTime').value;
@@ -668,8 +675,14 @@ const dashboardHTML = `<!DOCTYPE html>
                     );
                     data = await response.json();
                     
+                    const endTime = performance.now();
+                    const responseTime = (endTime - startTime).toFixed(2);
+                    const dataPoints = data.data?.result?.[0]?.values?.length || 0;
+                    
                     resultDiv.style.display = 'block';
-                    outputPre.textContent = JSON.stringify(data, null, 2);
+                    outputPre.innerHTML = '<strong style="color: #667eea;">⏱️ Response Time: ' + responseTime + ' ms</strong> | ' +
+                                          '<strong style="color: #764ba2;">📊 Data Points: ' + dataPoints + '</strong>\n\n' +
+                                          JSON.stringify(data, null, 2);
                     
                     // Draw chart
                     if (data.status === 'success' && data.data.result && data.data.result.length > 0) {
@@ -683,9 +696,13 @@ const dashboardHTML = `<!DOCTYPE html>
                 document.getElementById('queryCount2').textContent = queryCounter;
                 
             } catch (error) {
+                const endTime = performance.now();
+                const responseTime = (endTime - startTime).toFixed(2);
+                
                 resultDiv.style.display = 'block';
                 chartContainer.style.display = 'none';
-                outputPre.textContent = 'Error: ' + error.message;
+                outputPre.innerHTML = '<strong style="color: #f5576c;">⏱️ Response Time: ' + responseTime + ' ms (Error)</strong>\n\n' +
+                                      'Error: ' + error.message;
             }
         }
 
@@ -857,6 +874,8 @@ const dashboardHTML = `<!DOCTYPE html>
         let cachedMetrics = [];
         
         async function loadAllMetrics() {
+            const startTime = performance.now();
+            
             try {
                 const filter = document.getElementById('metricsFilter').value.trim();
                 const url = filter ? '/api/v1/metrics?filter=' + encodeURIComponent(filter) : '/api/v1/metrics';
@@ -864,9 +883,12 @@ const dashboardHTML = `<!DOCTYPE html>
                 const response = await fetch(url);
                 const data = await response.json();
                 
+                const endTime = performance.now();
+                const responseTime = (endTime - startTime).toFixed(2);
+                
                 if (data.status === 'success') {
                     cachedMetrics = data.data || [];
-                    displayMetrics(cachedMetrics);
+                    displayMetrics(cachedMetrics, responseTime);
                     
                     // Update stats
                     const now = new Date().toLocaleTimeString();
@@ -876,12 +898,15 @@ const dashboardHTML = `<!DOCTYPE html>
                         '<div class="alert alert-error">Error: ' + data.error + '</div>';
                 }
             } catch (error) {
+                const endTime = performance.now();
+                const responseTime = (endTime - startTime).toFixed(2);
+                
                 document.getElementById('metricsResult').innerHTML = 
-                    '<div class="alert alert-error">Error loading metrics: ' + error.message + '</div>';
+                    '<div class="alert alert-error">Error loading metrics (' + responseTime + ' ms): ' + error.message + '</div>';
             }
         }
 
-        function displayMetrics(metrics) {
+        function displayMetrics(metrics, responseTime) {
             const resultDiv = document.getElementById('metricsResult');
             
             if (!metrics || metrics.length === 0) {
@@ -890,7 +915,8 @@ const dashboardHTML = `<!DOCTYPE html>
                 return;
             }
 
-            let html = '<div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 15px;">';
+            let html = '<div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 15px; border-radius: 8px; margin-bottom: 15px; color: white;">';
+            html += '<strong>⏱️ Response Time: ' + responseTime + ' ms</strong> | ';
             html += '<strong>Total: ' + metrics.length + ' metrics</strong>';
             html += '</div>';
             html += '<div style="max-height: 500px; overflow-y: auto; background: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px;">';
