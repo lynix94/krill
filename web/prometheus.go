@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"sync"
 
 	"github.com/lynix/krill"
 	"github.com/lynix/krill/storage"
@@ -390,39 +391,73 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 		matchingSeries = allSeries
 	}
 
-	// Filter series by name and labels
+	// Filter series by name and labels - PARALLEL PROCESSING
+	type seriesResult struct {
+		labels storage.Labels
+		timestamps []int64
+		values []float64
+	}
+	
+	resultChan := make(chan seriesResult, len(matchingSeries))
+	var wg sync.WaitGroup
+	
+	// Limit concurrent goroutines to avoid overwhelming the system
+	semaphore := make(chan struct{}, 100) // Max 100 concurrent queries
+	
 	for _, labels := range matchingSeries {
 		if matchesLabels(labels, parsed.MetricName, parsed.LabelMatchers) {
-			// Format labels to metric key for DB lookup
-			metric := formatLabelsAsMetricString(labels)
+			wg.Add(1)
+			go func(lbls storage.Labels) {
+				defer wg.Done()
+				semaphore <- struct{}{} // Acquire
+				defer func() { <-semaphore }() // Release
+				
+				// Format labels to metric key for DB lookup
+				metric := formatLabelsAsMetricString(lbls)
 
-			// Query TSDB for this specific metric
-			timestamps, values, err := ph.tsdb.Get(metric, start, end)
-			if err != nil {
-				continue
-			}
-
-			if len(values) > 0 {
-				// Apply step-based downsampling if step is specified
-				if step > 0 {
-					timestamps, values = downsampleByStep(timestamps, values, start, end, step)
+				// Query TSDB for this specific metric
+				timestamps, values, err := ph.tsdb.Get(metric, start, end)
+				if err != nil || len(values) == 0 {
+					return
 				}
 
-				valuesArray := make([][]interface{}, len(values))
-				for i := range values {
-					valuesArray[i] = []interface{}{timestamps[i], fmt.Sprintf("%f", values[i])}
+				resultChan <- seriesResult{
+					labels: lbls,
+					timestamps: timestamps,
+					values: values,
 				}
-				// Build tags map from labels
-				parsedTags := make(map[string]string)
-				for _, label := range labels {
-					parsedTags[label.Name] = label.Value
-				}
-				result = append(result, QueryResult{
-					Metric: parsedTags,
-					Values: valuesArray,
-				})
-			}
+			}(labels)
 		}
+	}
+	
+	// Close channel when all goroutines complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+	
+	// Collect results
+	for sr := range resultChan {
+		timestamps, values := sr.timestamps, sr.values
+		
+		// Apply step-based downsampling if step is specified
+		if step > 0 {
+			timestamps, values = downsampleByStep(timestamps, values, start, end, step)
+		}
+
+		valuesArray := make([][]interface{}, len(values))
+		for i := range values {
+			valuesArray[i] = []interface{}{timestamps[i], fmt.Sprintf("%f", values[i])}
+		}
+		// Build tags map from labels
+		parsedTags := make(map[string]string)
+		for _, label := range sr.labels {
+			parsedTags[label.Name] = label.Value
+		}
+		result = append(result, QueryResult{
+			Metric: parsedTags,
+			Values: valuesArray,
+		})
 	}
 
 	// Apply aggregation if specified
