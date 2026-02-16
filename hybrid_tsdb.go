@@ -394,6 +394,34 @@ func (h *HybridTSDB) GetAllSeries() ([]storage.Labels, error) {
 	return series, nil
 }
 
+// GetSeriesCount returns the total number of unique series (fast, O(1))
+func (h *HybridTSDB) GetSeriesCount() int {
+	// Persistent storage has all series (memory is subset)
+	if counter, ok := h.persistStorage.(interface{ GetSeriesCount() int }); ok {
+		return counter.GetSeriesCount()
+	}
+	// Fallback: use GetAllSeries (slow)
+	series, err := h.GetAllSeries()
+	if err != nil {
+		return 0
+	}
+	return len(series)
+}
+
+// GetMetricCount returns the number of unique metrics (uses cache)
+func (h *HybridTSDB) GetMetricCount() int {
+	// Persistent storage has all metrics (memory is subset)
+	if counter, ok := h.persistStorage.(interface{ GetMetricCount() int }); ok {
+		return counter.GetMetricCount()
+	}
+	// Fallback: use GetMetrics (slow)
+	metrics, err := h.GetMetrics()
+	if err != nil {
+		return 0
+	}
+	return len(metrics)
+}
+
 // FindSeriesByLabels finds series IDs matching the given label matchers using inverted index
 // Delegates to persistent storage which has the inverted index
 func (h *HybridTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uint64 {

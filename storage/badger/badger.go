@@ -964,6 +964,39 @@ func (bdb *BadgerTSDB) GetMetrics() ([]string, error) {
 	return result, nil
 }
 
+// GetSeriesCount returns the total number of time series (fast, O(1))
+func (bdb *BadgerTSDB) GetSeriesCount() int {
+	bdb.labelsMu.RLock()
+	count := len(bdb.labels)
+	bdb.labelsMu.RUnlock()
+	return count
+}
+
+// GetMetricCount returns the number of unique metrics (uses cache)
+func (bdb *BadgerTSDB) GetMetricCount() int {
+	// Check cache first
+	bdb.metricsCacheMu.RLock()
+	if bdb.metricsCache != nil && time.Since(bdb.metricsCacheTime) < bdb.metricsCacheTTL {
+		count := len(bdb.metricsCache)
+		bdb.metricsCacheMu.RUnlock()
+		return count
+	}
+	bdb.metricsCacheMu.RUnlock()
+
+	// Cache miss - count unique metric names
+	metrics := make(map[string]bool)
+	bdb.labelsMu.RLock()
+	for _, labels := range bdb.labels {
+		metricName := labels.Get("__name__")
+		if metricName != "" {
+			metrics[metricName] = true
+		}
+	}
+	bdb.labelsMu.RUnlock()
+	
+	return len(metrics)
+}
+
 // Close closes the database
 func (bdb *BadgerTSDB) Close() error {
 	return bdb.db.Close()

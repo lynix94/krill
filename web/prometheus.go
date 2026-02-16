@@ -21,6 +21,7 @@ import (
 type PrometheusHandler struct {
 	tsdb       krill.QueryableDB
 	debugIndex bool
+	stats      *Stats
 }
 
 // NewPrometheusHandler creates a new Prometheus API handler
@@ -82,6 +83,13 @@ type KrillQLRequest struct {
 
 // HandleQuery handles instant queries: GET or POST /api/v1/query
 func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	defer func() {
+		if ph.stats != nil {
+			ph.stats.RecordInstantQuery(time.Since(startTime))
+		}
+	}()
+
 	// Support both GET and POST methods (Grafana uses both)
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -236,6 +244,13 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 
 // HandleQueryRange handles range queries: GET or POST /api/v1/query_range
 func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	defer func() {
+		if ph.stats != nil {
+			ph.stats.RecordRangeQuery(time.Since(startTime))
+		}
+	}()
+
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -340,9 +355,7 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	var result []QueryResult
 	var matchingSeries []storage.Labels
 
-	log.Printf("[DEBUG-RANGE] TSDB type: %T, MetricName: %q", ph.tsdb, parsed.MetricName)
 	if finder, ok := ph.tsdb.(IndexFinder); ok && parsed.MetricName != "" {
-		log.Printf("[DEBUG-RANGE] IndexFinder type assertion successful")
 		// Use inverted index to find matching series
 		// Even with just metric name, index helps narrow down from 500k to thousands
 		allMatchers := make(map[string]string)
@@ -521,6 +534,10 @@ func (ph *PrometheusHandler) HandleWrite(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if ph.stats != nil {
+		ph.stats.RecordSingleWrite(1)
+	}
+
 	ph.sendSuccess(w, nil)
 }
 
@@ -583,6 +600,10 @@ func (ph *PrometheusHandler) HandleBatchWrite(w http.ResponseWriter, r *http.Req
 	if err := ph.tsdb.TsdbPutBatch(points); err != nil {
 		ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to write batch: %v", err))
 		return
+	}
+
+	if ph.stats != nil {
+		ph.stats.RecordBatchWrite(len(points))
 	}
 
 	ph.sendSuccess(w, map[string]int{"written": len(points)})

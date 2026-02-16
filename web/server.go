@@ -17,6 +17,7 @@ type Server struct {
 	tsdb    krill.QueryableDB
 	handler *PrometheusHandler
 	server  *http.Server
+	stats   *Stats
 }
 
 // ServerOptions configures the web server
@@ -33,8 +34,10 @@ func NewServer(opts ServerOptions) *Server {
 		opts.Addr = ":9090"
 	}
 
+	stats := NewStats()
 	handler := NewPrometheusHandler(opts.TSDB)
 	handler.debugIndex = opts.DebugIndex
+	handler.stats = stats
 
 	mux := http.NewServeMux()
 
@@ -68,6 +71,23 @@ func NewServer(opts ServerOptions) *Server {
 
 	// KrillQL API with JSON support for multiple queries
 	mux.HandleFunc("/api/v1/krillql", handler.HandleKrillQL)
+
+	// Internal metrics endpoint (Prometheus exporter format)
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		// Get current series count and metric count (fast O(1) operations)
+		seriesCount := 0
+		metricCount := 0
+		if seriesCounter, ok := opts.TSDB.(interface{ GetSeriesCount() int }); ok {
+			seriesCount = seriesCounter.GetSeriesCount()
+		}
+		if metricCounter, ok := opts.TSDB.(interface{ GetMetricCount() int }); ok {
+			metricCount = metricCounter.GetMetricCount()
+		}
+		
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(stats.ToPrometheusFormat(seriesCount, metricCount)))
+	})
 
 	// Prometheus buildinfo endpoint (required by Grafana)
 	// Mimics Prometheus 2.x response format for compatibility
@@ -152,6 +172,7 @@ func NewServer(opts ServerOptions) *Server {
 		tsdb:    opts.TSDB,
 		handler: handler,
 		server:  srv,
+		stats:   stats,
 	}
 }
 
