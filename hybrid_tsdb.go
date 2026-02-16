@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/lynix/krill/storage"
+	"github.com/lynix/krill/storage/badger"
 	"github.com/lynix/krill/storage/memory"
 	"github.com/lynix/krill/storage/persistence"
-	"github.com/lynix/krill/storage/badger"
 )
 
 // HybridTSDB combines memory cache and persistent storage
@@ -19,6 +19,7 @@ type HybridTSDB struct {
 	persistStorage   storage.Storage
 	cacheDuration    time.Duration
 	cleanupInterval  time.Duration
+	serverStartTime  int64 // Unix timestamp when server started
 	mu               sync.RWMutex
 	stopCleanup      chan struct{}
 	cleanupDone      chan struct{}
@@ -65,6 +66,7 @@ func NewHybridTSDB(opts HybridOptions) (*HybridTSDB, error) {
 		persistStorage:  persistStore,
 		cacheDuration:   opts.CacheDuration,
 		cleanupInterval: opts.CleanupInterval,
+		serverStartTime: time.Now().Unix(), // Record server start time
 		stopCleanup:     make(chan struct{}),
 		cleanupDone:     make(chan struct{}),
 		metricsCacheTTL: 5 * time.Minute, // 5 minutes cache
@@ -135,17 +137,24 @@ func (h *HybridTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float6
 	var allTimestamps []int64
 	var allValues []float64
 
-	// Calculate cache cutoff (e.g., 2 hours ago)
+	// Calculate effective cache cutoff: max(now - cacheDuration, serverStartTime)
+	// This ensures we query persistent storage for data before server restart
 	now := time.Now().Unix()
 	cacheCutoff := now - int64(h.cacheDuration.Seconds())
 
-	// If query is entirely in the old range (before cache cutoff), use persistent storage only
-	if endTs < cacheCutoff {
+	// IMPORTANT: Use server start time as minimum cache cutoff
+	// Before this time, memory cache has no data (server wasn't running)
+	if h.serverStartTime > cacheCutoff {
+		cacheCutoff = h.serverStartTime
+	}
+
+	// If query is entirely before server start, use persistent storage only
+	if endTs < h.serverStartTime {
 		return h.persistStorage.Get(metric, startTs, endTs)
 	}
 
 	// Query overlaps with cache range - check both storages
-	// Get old data from persistent storage
+	// Get old data from persistent storage (before cache cutoff)
 	if startTs < cacheCutoff {
 		persistTimestamps, persistValues, err := h.persistStorage.Get(metric, startTs, cacheCutoff-1)
 		if err != nil && !strings.Contains(err.Error(), "metric not found") {
@@ -158,7 +167,8 @@ func (h *HybridTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float6
 	}
 
 	// Get recent data from both memory cache AND persistent storage
-	// (persistent storage has data written before restart)
+	// Memory cache: data after server start
+	// Persistent storage: all data (including before restart)
 	cacheStart := cacheCutoff
 	if startTs > cacheStart {
 		cacheStart = startTs
@@ -197,17 +207,24 @@ func (h *HybridTSDB) GetLabels(labels storage.Labels, startTs, endTs int64) ([]i
 	var allTimestamps []int64
 	var allValues []float64
 
-	// Calculate cache cutoff (e.g., 2 hours ago)
+	// Calculate effective cache cutoff: max(now - cacheDuration, serverStartTime)
+	// This ensures we query persistent storage for data before server restart
 	now := time.Now().Unix()
 	cacheCutoff := now - int64(h.cacheDuration.Seconds())
 
-	// If query is entirely in the old range (before cache cutoff), use persistent storage only
-	if endTs < cacheCutoff {
+	// IMPORTANT: Use server start time as minimum cache cutoff
+	// Before this time, memory cache has no data (server wasn't running)
+	if h.serverStartTime > cacheCutoff {
+		cacheCutoff = h.serverStartTime
+	}
+
+	// If query is entirely before server start, use persistent storage only
+	if endTs < h.serverStartTime {
 		return h.persistStorage.GetLabels(labels, startTs, endTs)
 	}
 
 	// Query overlaps with cache range - check both storages
-	// Get old data from persistent storage
+	// Get old data from persistent storage (before cache cutoff)
 	if startTs < cacheCutoff {
 		persistTimestamps, persistValues, err := h.persistStorage.GetLabels(labels, startTs, cacheCutoff-1)
 		if err != nil && !strings.Contains(err.Error(), "metric not found") && !strings.Contains(err.Error(), "series not found") {
@@ -220,7 +237,8 @@ func (h *HybridTSDB) GetLabels(labels storage.Labels, startTs, endTs int64) ([]i
 	}
 
 	// Get recent data from both memory cache AND persistent storage
-	// (persistent storage has data written before restart)
+	// Memory cache: data after server start
+	// Persistent storage: all data (including before restart)
 	cacheStart := cacheCutoff
 	if startTs > cacheStart {
 		cacheStart = startTs
@@ -336,11 +354,11 @@ func (h *HybridTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uint6
 	type IndexFinder interface {
 		FindSeriesByLabels(map[string]string) []uint64
 	}
-	
+
 	if finder, ok := h.persistStorage.(IndexFinder); ok {
 		return finder.FindSeriesByLabels(labelMatchers)
 	}
-	
+
 	// Fallback: return empty (will trigger full scan)
 	return []uint64{}
 }
@@ -352,11 +370,11 @@ func (h *HybridTSDB) GetLabelsForSeriesID(seriesID uint64) (storage.Labels, bool
 	type LabelsGetter interface {
 		GetLabelsForSeriesID(uint64) (storage.Labels, bool)
 	}
-	
+
 	if getter, ok := h.persistStorage.(LabelsGetter); ok {
 		return getter.GetLabelsForSeriesID(seriesID)
 	}
-	
+
 	// Fallback: not found
 	return nil, false
 }
@@ -437,7 +455,7 @@ func deduplicateTimeseries(timestamps []int64, values []float64) ([]int64, []flo
 	for ts := range tsMap {
 		sortedTs = append(sortedTs, ts)
 	}
-	
+
 	// Sort using a simple bubble sort for small datasets or use sort package
 	for i := 0; i < len(sortedTs)-1; i++ {
 		for j := i + 1; j < len(sortedTs); j++ {
