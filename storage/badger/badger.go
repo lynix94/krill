@@ -305,8 +305,9 @@ func (bdb *BadgerTSDB) writeBatchChunk(points []storage.DataPoint) error {
 	bdb.labelsMu.Unlock()
 
 	// Update index for new series
-	for seriesID, labels := range newSeries {
-		bdb.updateLabelIndex(seriesID, labels)
+	if len(newSeries) > 0 {
+		// Batch update all new series indices in one transaction
+		bdb.updateLabelIndexBatch(newSeries)
 	}
 
 	// Invalidate cache
@@ -596,6 +597,71 @@ func (bdb *BadgerTSDB) updateLabelIndex(seriesID uint64, labels storage.Labels) 
 	}
 }
 
+// updateLabelIndexBatch updates the inverted index for multiple series in one transaction
+// More efficient and avoids WriteBatch conflicts
+func (bdb *BadgerTSDB) updateLabelIndexBatch(newSeries map[uint64]storage.Labels) {
+	bdb.labelIndexMu.Lock()
+	defer bdb.labelIndexMu.Unlock()
+
+	// Single WriteBatch for all series
+	wb := bdb.db.NewWriteBatch()
+	defer wb.Cancel()
+
+	// Track which posting lists need to be persisted
+	updatedPostings := make(map[string]bool)
+
+	for seriesID, labels := range newSeries {
+		for _, label := range labels {
+			// Create label name map if not exists
+			if bdb.labelIndex[label.Name] == nil {
+				bdb.labelIndex[label.Name] = make(map[string][]uint64)
+			}
+
+			// Add seriesID to posting list
+			posting := bdb.labelIndex[label.Name][label.Value]
+			// Check if already exists
+			alreadyExists := false
+			for _, id := range posting {
+				if id == seriesID {
+					alreadyExists = true
+					break
+				}
+			}
+
+			if !alreadyExists {
+				bdb.labelIndex[label.Name][label.Value] = append(posting, seriesID)
+				// Mark this posting list as updated
+				updatedPostings[fmt.Sprintf("%s:%s", label.Name, label.Value)] = true
+			}
+		}
+	}
+
+	// Persist all updated posting lists
+	for postingKey := range updatedPostings {
+		parts := strings.SplitN(postingKey, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		labelName, labelValue := parts[0], parts[1]
+
+		key := fmt.Sprintf("idx:%s:%s", labelName, labelValue)
+		seriesIDs := bdb.labelIndex[labelName][labelValue]
+		buf := make([]byte, len(seriesIDs)*8)
+		for i, id := range seriesIDs {
+			binary.BigEndian.PutUint64(buf[i*8:], id)
+		}
+
+		if err := wb.Set([]byte(key), buf); err != nil {
+			log.Printf("[BADGER-INDEX] Warning: failed to add index entry to batch: %v", err)
+		}
+	}
+
+	// Single flush for all updates
+	if err := wb.Flush(); err != nil {
+		log.Printf("[BADGER-INDEX] Warning: failed to persist index updates: %v", err)
+	}
+}
+
 // updateLabelIndexBulk is used during initial index building (without DB persistence)
 func (bdb *BadgerTSDB) updateLabelIndexBulk(seriesID uint64, labels storage.Labels) {
 	bdb.labelIndexMu.Lock()
@@ -749,6 +815,16 @@ func (bdb *BadgerTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uin
 	for labelName, labelValue := range labelMatchers {
 		if valueMap, ok := bdb.labelIndex[labelName]; ok {
 			log.Printf("[BADGER-INDEX] Label %q has %d values", labelName, len(valueMap))
+			
+			// Debug: print all available values for this label
+			if labelName == "__name__" {
+				availableValues := make([]string, 0, len(valueMap))
+				for v := range valueMap {
+					availableValues = append(availableValues, v)
+				}
+				log.Printf("[BADGER-INDEX] Available values for __name__: %v", availableValues)
+			}
+			
 			if posting, ok := valueMap[labelValue]; ok {
 				log.Printf("[BADGER-INDEX] Label %q=%q has %d series", labelName, labelValue, len(posting))
 				if smallestSize == -1 || len(posting) < smallestSize {
@@ -758,6 +834,7 @@ func (bdb *BadgerTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uin
 			} else {
 				// Label value not found - no matches
 				log.Printf("[BADGER-INDEX] Label value %q not found for label %q", labelValue, labelName)
+				log.Printf("[BADGER-INDEX] Searched for (len=%d, bytes=%v)", len(labelValue), []byte(labelValue))
 				return nil
 			}
 		} else {
@@ -943,11 +1020,51 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 	}
 
 	// Try to load persisted index first
+	indexLoadedSuccessfully := false
 	if err := bdb.loadIndexFromDB(); err != nil {
 		log.Printf("[BADGER-INDEX] No persisted index found, building from scratch...")
-
+	} else {
+		// Simple completeness check: compare number of loaded series vs indexed series
+		// by counting unique __name__ values in the index
+		
+		totalSeries := len(bdb.labels)
+		
+		bdb.labelIndexMu.RLock()
+		uniqueMetricNames := 0
+		if nameMap, ok := bdb.labelIndex["__name__"]; ok {
+			uniqueMetricNames = len(nameMap)
+		}
+		totalPostingLists := 0
+		for _, valueMap := range bdb.labelIndex {
+			totalPostingLists += len(valueMap)
+		}
+		bdb.labelIndexMu.RUnlock()
+		
+		log.Printf("[BADGER-INDEX] Loaded %d series, index has %d unique metric names, %d total posting lists",
+			totalSeries, uniqueMetricNames, totalPostingLists)
+		
+		// If we have many series but very few metric names, index is incomplete
+		// Heuristic: expect at least 100 metric names for 90k+ series (Arcus has 100+)
+		if totalSeries > 10000 && uniqueMetricNames < 50 {
+			log.Printf("[BADGER-INDEX] WARNING: Index appears incomplete (%d series but only %d metric names), rebuilding...", 
+				totalSeries, uniqueMetricNames)
+			indexLoadedSuccessfully = false
+		} else {
+			log.Printf("[BADGER-INDEX] Successfully loaded persisted index with %d label names", len(bdb.labelIndex))
+			indexLoadedSuccessfully = true
+		}
+	}
+	
+	// Rebuild index if needed
+	if !indexLoadedSuccessfully {
 		// Build inverted index from loaded series (without persisting each update)
 		log.Printf("[BADGER-INDEX] Building inverted index from %d series...", len(bdb.labels))
+		
+		// Clear existing index
+		bdb.labelIndexMu.Lock()
+		bdb.labelIndex = make(map[string]map[string][]uint64)
+		bdb.labelIndexMu.Unlock()
+		
 		count := 0
 		progressInterval := 100000 // Log every 100k series
 		for seriesID, labels := range bdb.labels {
@@ -968,8 +1085,6 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 		} else {
 			log.Printf("[BADGER-INDEX] Index persisted successfully")
 		}
-	} else {
-		log.Printf("[BADGER-INDEX] Successfully loaded persisted index with %d label names", len(bdb.labelIndex))
 	}
 
 	if skippedCount > 0 {
