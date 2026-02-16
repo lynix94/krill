@@ -19,13 +19,20 @@ type HybridTSDB struct {
 	persistStorage   storage.Storage
 	cacheDuration    time.Duration
 	cleanupInterval  time.Duration
-	serverStartTime  int64 // Unix timestamp when server started
+	serverStartTime  int64         // Unix timestamp when server started
 	mu               sync.RWMutex
 	stopCleanup      chan struct{}
 	cleanupDone      chan struct{}
 	metricsCache     []string      // cached GetMetrics() result
 	metricsCacheTime time.Time     // last cache update time
 	metricsCacheTTL  time.Duration // cache TTL (default 5 minutes)
+	
+	// Async write queue for performance
+	writeQueue      chan []storage.DataPoint
+	flushInterval   time.Duration
+	stopWriter      chan struct{}
+	writerDone      chan struct{}
+	asyncWrites     bool  // Enable/disable async writes
 }
 
 // HybridOptions contains configuration for HybridTSDB
@@ -34,6 +41,9 @@ type HybridOptions struct {
 	CacheDuration   time.Duration // How long to keep data in memory cache (default: 2 hours)
 	CleanupInterval time.Duration // How often to cleanup old cache data (default: 10 minutes)
 	TTL             time.Duration // TTL for persistent storage (0 = no expiration)
+	AsyncWrites     bool          // Enable async disk writes for better performance (default: true)
+	FlushInterval   time.Duration // How often to flush async writes to disk (default: 5 seconds)
+	WriteQueueSize  int           // Size of async write queue (default: 1000)
 }
 
 // NewHybridTSDB creates a new hybrid TSDB with memory cache and persistent storage
@@ -47,6 +57,17 @@ func NewHybridTSDB(opts HybridOptions) (*HybridTSDB, error) {
 	}
 	if opts.PersistencePath == "" {
 		opts.PersistencePath = "./krill_hybrid_data"
+	}
+	if opts.FlushInterval == 0 {
+		opts.FlushInterval = 5 * time.Second
+	}
+	if opts.WriteQueueSize == 0 {
+		opts.WriteQueueSize = 1000
+	}
+	// Async writes enabled by default for performance
+	asyncWrites := true
+	if !opts.AsyncWrites && opts.AsyncWrites {  // Explicitly disabled
+		asyncWrites = false
 	}
 
 	// Create memory cache
@@ -70,10 +91,20 @@ func NewHybridTSDB(opts HybridOptions) (*HybridTSDB, error) {
 		stopCleanup:     make(chan struct{}),
 		cleanupDone:     make(chan struct{}),
 		metricsCacheTTL: 5 * time.Minute, // 5 minutes cache
+		writeQueue:      make(chan []storage.DataPoint, opts.WriteQueueSize),
+		flushInterval:   opts.FlushInterval,
+		stopWriter:      make(chan struct{}),
+		writerDone:      make(chan struct{}),
+		asyncWrites:     asyncWrites,
 	}
 
 	// Start background cleanup goroutine
 	go h.cleanupLoop()
+	
+	// Start async writer if enabled
+	if h.asyncWrites {
+		go h.asyncWriterLoop()
+	}
 
 	return h, nil
 }
@@ -95,17 +126,31 @@ func (h *HybridTSDB) TsdbPut(ts int64, metric string, value float64) error {
 
 // TsdbPutBatch stores multiple data points efficiently
 func (h *HybridTSDB) TsdbPutBatch(points []storage.DataPoint) error {
-	// Write to memory cache first (fast path)
+	// Write to memory cache first (fast path - always synchronous)
 	if err := h.memoryCache.PutBatch(points); err != nil {
 		return fmt.Errorf("failed to write batch to memory cache: %w", err)
 	}
 
 	// Write to persistent storage
-	if err := h.persistStorage.PutBatch(points); err != nil {
-		return fmt.Errorf("failed to write batch to persistent storage: %w", err)
+	if h.asyncWrites {
+		// Async mode: queue for background writer (non-blocking)
+		select {
+		case h.writeQueue <- points:
+			// Successfully queued
+		default:
+			// Queue full - log warning but don't block
+			// Data is still safe in memory cache
+			fmt.Printf("[WARN] Write queue full (%d items), skipping disk write for %d points\n", 
+				len(h.writeQueue), len(points))
+		}
+		return nil
+	} else {
+		// Sync mode: write immediately (blocking)
+		if err := h.persistStorage.PutBatch(points); err != nil {
+			return fmt.Errorf("failed to write batch to persistent storage: %w", err)
+		}
+		return nil
 	}
-
-	return nil
 }
 
 // PutLabels stores a data point with labels in both memory cache and persistent storage (dual write)
@@ -384,6 +429,12 @@ func (h *HybridTSDB) Close() error {
 	// Stop cleanup goroutine
 	close(h.stopCleanup)
 	<-h.cleanupDone
+	
+	// Stop async writer if running
+	if h.asyncWrites {
+		close(h.stopWriter)
+		<-h.writerDone
+	}
 
 	var errs []error
 
@@ -400,6 +451,74 @@ func (h *HybridTSDB) Close() error {
 	}
 
 	return nil
+}
+
+// asyncWriterLoop runs in background to flush write queue to disk periodically
+func (h *HybridTSDB) asyncWriterLoop() {
+	defer close(h.writerDone)
+	
+	ticker := time.NewTicker(h.flushInterval)
+	defer ticker.Stop()
+	
+	// Accumulate points for batch writing
+	batch := make([]storage.DataPoint, 0, 10000)
+	var batchCount int
+	var totalFlushed int64
+	
+	flushBatch := func() {
+		if len(batch) == 0 {
+			return
+		}
+		
+		startTime := time.Now()
+		if err := h.persistStorage.PutBatch(batch); err != nil {
+			fmt.Printf("[ERROR] Failed to flush batch (%d points): %v\n", len(batch), err)
+		} else {
+			batchCount++
+			totalFlushed += int64(len(batch))
+			elapsed := time.Since(startTime)
+			if batchCount%10 == 0 {  // Log every 10 flushes
+				fmt.Printf("[INFO] Async writer: flushed batch #%d (%d points, %v, total: %d)\n", 
+					batchCount, len(batch), elapsed, totalFlushed)
+			}
+		}
+		
+		batch = batch[:0]  // Reuse slice
+	}
+	
+	for {
+		select {
+		case points := <-h.writeQueue:
+			batch = append(batch, points...)
+			
+			// Flush immediately if batch is large enough
+			if len(batch) >= 10000 {
+				flushBatch()
+			}
+			
+		case <-ticker.C:
+			// Periodic flush
+			flushBatch()
+			
+		case <-h.stopWriter:
+			// Final flush before shutdown
+			fmt.Println("[INFO] Async writer shutting down, flushing remaining data...")
+			
+			// Drain queue
+			for {
+				select {
+				case points := <-h.writeQueue:
+					batch = append(batch, points...)
+				default:
+					goto done
+				}
+			}
+		done:
+			flushBatch()
+			fmt.Printf("[INFO] Async writer stopped (total flushed: %d points)\n", totalFlushed)
+			return
+		}
+	}
 }
 
 // cleanupLoop periodically removes old data from memory cache
