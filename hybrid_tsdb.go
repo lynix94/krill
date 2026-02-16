@@ -45,6 +45,7 @@ type HybridOptions struct {
 	FlushInterval   time.Duration // How often to flush async writes to disk (default: 5 seconds)
 	WriteQueueSize  int           // Size of async write queue (default: 1000)
 	DebugIndex      bool          // Enable debug logging for index operations
+	ChunkSize       int           // BadgerDB batch chunk size (0 = use default 10000)
 }
 
 // NewHybridTSDB creates a new hybrid TSDB with memory cache and persistent storage
@@ -79,6 +80,7 @@ func NewHybridTSDB(opts HybridOptions) (*HybridTSDB, error) {
 		Path:       opts.PersistencePath,
 		TTL:        opts.TTL,
 		DebugIndex: opts.DebugIndex,
+		ChunkSize:  opts.ChunkSize,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create persistent storage: %w", err)
@@ -135,15 +137,26 @@ func (h *HybridTSDB) TsdbPutBatch(points []storage.DataPoint) error {
 
 	// Write to persistent storage
 	if h.asyncWrites {
-		// Async mode: queue for background writer (non-blocking)
+		// CRITICAL: Deep copy points to avoid holding references to caller's data structures.
+		// Shallow copy would share the Labels slice arrays, preventing GC of original points.
+		// The embedded scraper holds large allocations and needs to free them quickly.
+		pointsCopy := make([]storage.DataPoint, len(points))
+		for i := range points {
+			pointsCopy[i] = storage.DataPoint{
+				Timestamp: points[i].Timestamp,
+				Value:     points[i].Value,
+				Labels:    points[i].Labels.Copy(), // Deep copy labels
+			}
+		}
+		
+		// Queue for background writer (non-blocking)
 		select {
-		case h.writeQueue <- points:
+		case h.writeQueue <- pointsCopy:
 			// Successfully queued
 		default:
 			// Queue full - log warning but don't block
 			// Data is still safe in memory cache
-			fmt.Printf("[WARN] Write queue full (%d items), skipping disk write for %d points\n",
-				len(h.writeQueue), len(points))
+			fmt.Printf("[WARN] Write queue full, skipping disk write\n")
 		}
 		return nil
 	} else {
@@ -501,16 +514,17 @@ func (h *HybridTSDB) asyncWriterLoop() {
 		}
 
 		startTime := time.Now()
+		pointCount := len(batch)
+		fmt.Printf("[ASYNC-WRITE] Starting flush of %d points...\n", pointCount)
+		
 		if err := h.persistStorage.PutBatch(batch); err != nil {
-			fmt.Printf("[ERROR] Failed to flush batch (%d points): %v\n", len(batch), err)
+			fmt.Printf("[ERROR] Failed to flush batch (%d points): %v\n", pointCount, err)
 		} else {
 			batchCount++
-			totalFlushed += int64(len(batch))
+			totalFlushed += int64(pointCount)
 			elapsed := time.Since(startTime)
-			if batchCount%10 == 0 { // Log every 10 flushes
-				fmt.Printf("[INFO] Async writer: flushed batch #%d (%d points, %v, total: %d)\n",
-					batchCount, len(batch), elapsed, totalFlushed)
-			}
+			fmt.Printf("[ASYNC-WRITE] Completed batch #%d: %d points in %v (%.0f pts/sec, total: %d)\n",
+				batchCount, pointCount, elapsed, float64(pointCount)/elapsed.Seconds(), totalFlushed)
 		}
 
 		batch = batch[:0] // Reuse slice

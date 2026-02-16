@@ -23,6 +23,7 @@ func main() {
 	scrapeConfig := flag.String("scrape", "", "Path to scraper config YAML file (enables embedded scraping for 10x+ performance)")
 	printQuery := flag.Bool("printQuery", false, "Print all incoming HTTP requests for debugging")
 	debugIndex := flag.Bool("debugIndex", false, "Enable debug logging for index operations")
+	chunkSize := flag.Int("chunkSize", 10000, "BadgerDB batch chunk size (default: 10000, larger = faster writes but more memory)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -46,6 +47,7 @@ func main() {
 			CacheDuration:   *cacheDuration,
 			TTL:             *retention,
 			DebugIndex:      *debugIndex,
+			ChunkSize:       *chunkSize,
 		})
 		if err != nil {
 			log.Fatalf("Failed to create HybridTSDB: %v", err)

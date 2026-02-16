@@ -34,6 +34,7 @@ type BadgerTSDB struct {
 	labelIndexMu sync.RWMutex
 
 	debugIndex bool // Enable debug logging for index operations
+	chunkSize  int  // Batch chunk size for transactions (default: 10000)
 }
 
 // BadgerOptions contains configuration for BadgerTSDB
@@ -41,6 +42,7 @@ type BadgerOptions struct {
 	Path       string        // Directory path for database
 	TTL        time.Duration // Time-to-live for data points (0 = no expiration)
 	DebugIndex bool          // Enable debug logging for index operations
+	ChunkSize  int           // Batch chunk size for transactions (0 = use default 10000)
 }
 
 // CleanupCorruptedDatabase removes corrupted database files and allows fresh start
@@ -97,16 +99,16 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 	badgerOpts := badger.DefaultOptions(opts.Path)
 	badgerOpts.Logger = nil // Disable logging for cleaner output
 
-	// Data integrity and corruption prevention settings
-	badgerOpts.SyncWrites = true            // Sync writes to disk (prevents corruption on crash)
+	// Performance-optimized settings for high-throughput TSDB workload
+	badgerOpts.SyncWrites = false           // Async writes (10-100x faster, acceptable risk with 2hr memory cache)
 	badgerOpts.DetectConflicts = false      // Better performance for TSDB workload
 	badgerOpts.CompactL0OnClose = true      // Cleanup on shutdown
-	badgerOpts.NumCompactors = 2            // Parallel compaction
+	badgerOpts.NumCompactors = 4            // More parallel compaction for faster writes
 	badgerOpts.NumLevelZeroTables = 5       // Trigger compaction earlier
 	badgerOpts.NumLevelZeroTablesStall = 10 // Prevent too many L0 tables
-	badgerOpts.ValueLogFileSize = 64 << 20  // 64MB value log files (smaller = less corruption impact)
-	badgerOpts.MemTableSize = 32 << 20      // 32MB memtable (more frequent flushes)
-	badgerOpts.BlockCacheSize = 128 << 20   // 128MB block cache
+	badgerOpts.ValueLogFileSize = 256 << 20 // 256MB value log files (fewer rotations)
+	badgerOpts.MemTableSize = 128 << 20     // 128MB memtable (fewer flushes, better batching)
+	badgerOpts.BlockCacheSize = 256 << 20   // 256MB block cache (more read cache)
 
 	db, err := badger.Open(badgerOpts)
 	if err != nil {
@@ -130,6 +132,12 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 		metricsCacheTTL:  5 * time.Minute, // 5 minutes cache
 		labelIndex:       make(map[string]map[string][]uint64),
 		debugIndex:       opts.DebugIndex,
+		chunkSize:        opts.ChunkSize,
+	}
+
+	// Set default chunk size if not specified
+	if bdb.chunkSize <= 0 {
+		bdb.chunkSize = 10000
 	}
 
 	// Load all series labels from database
@@ -266,7 +274,8 @@ func (bdb *BadgerTSDB) TsdbPut(ts int64, metric string, value float64) error {
 // TsdbPutBatch stores multiple time-series data points efficiently
 func (bdb *BadgerTSDB) TsdbPutBatch(points []storage.DataPoint) error {
 	// Split large batches into chunks to avoid "Txn is too big" error
-	const maxChunkSize = 1000 // Process 1000 points per transaction
+	// Larger chunks = fewer transactions = better performance
+	maxChunkSize := bdb.chunkSize
 
 	for i := 0; i < len(points); i += maxChunkSize {
 		end := i + maxChunkSize
