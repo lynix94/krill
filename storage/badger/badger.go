@@ -134,6 +134,12 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 		return nil, fmt.Errorf("failed to load series: %w", err)
 	}
 
+	// Start background garbage collection if TTL is set
+	if opts.TTL > 0 {
+		go bdb.runBackgroundGC()
+		log.Printf("Started background GC with %v retention period", opts.TTL)
+	}
+
 	return bdb, nil
 }
 
@@ -952,6 +958,22 @@ func (bdb *BadgerTSDB) Close() error {
 // RunGC runs garbage collection to reclaim disk space
 func (bdb *BadgerTSDB) RunGC() error {
 	return bdb.db.RunValueLogGC(0.5)
+}
+
+// runBackgroundGC runs garbage collection periodically to clean up expired data
+func (bdb *BadgerTSDB) runBackgroundGC() {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Run value log GC to reclaim disk space from deleted/expired entries
+		err := bdb.db.RunValueLogGC(0.5)
+		if err != nil && err != badger.ErrNoRewrite {
+			log.Printf("Background GC error: %v", err)
+		} else if err == nil {
+			log.Printf("Background GC completed successfully")
+		}
+	}
 }
 
 // loadAllSeries scans the database and loads all series labels into memory

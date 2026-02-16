@@ -18,6 +18,7 @@ func main() {
 	addr := flag.String("addr", ":9090", "HTTP server listen address")
 	dataDir := flag.String("data", "/tmp/krill-data", "Data directory for persistent storage")
 	cacheDuration := flag.Duration("cache", 2*time.Hour, "Memory cache duration (e.g., 2h, 30m)")
+	retention := flag.Duration("retention", 30*24*time.Hour, "Data retention period (e.g., 7d, 15d, 30d). Default: 30d")
 	memoryOnly := flag.Bool("memory", false, "Use memory-only storage (no persistence)")
 	scrapeConfig := flag.String("scrape", "", "Path to scraper config YAML file (enables embedded scraping for 10x+ performance)")
 	printQuery := flag.Bool("printQuery", false, "Print all incoming HTTP requests for debugging")
@@ -34,10 +35,15 @@ func main() {
 		log.Println("Using memory-only storage")
 		tsdb = krill.NewTSDB()
 	} else {
-		log.Printf("Using hybrid storage (cache: %v, data: %s)", *cacheDuration, *dataDir)
+		if *retention > 0 {
+			log.Printf("Using hybrid storage (cache: %v, retention: %v, data: %s)", *cacheDuration, *retention, *dataDir)
+		} else {
+			log.Printf("Using hybrid storage (cache: %v, no retention, data: %s)", *cacheDuration, *dataDir)
+		}
 		tsdb, err = krill.NewHybridTSDB(krill.HybridOptions{
 			PersistencePath: *dataDir,
 			CacheDuration:   *cacheDuration,
+			TTL:             *retention,
 		})
 		if err != nil {
 			log.Fatalf("Failed to create HybridTSDB: %v", err)
