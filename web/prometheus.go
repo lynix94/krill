@@ -599,13 +599,13 @@ func buildMetricKey(name string, tags map[string]string) string {
 	return fmt.Sprintf("%s{%s}", name, strings.Join(sortedTags, ","))
 }
 
-// buildLabels creates a Labels object from metric name and tags
+// buildLabels creates a Labels object from metric name and tags with string interning
 func buildLabels(name string, tags map[string]string) storage.Labels {
 	labels := make(storage.Labels, 0, len(tags)+1)
-	labels = append(labels, storage.Label{Name: "__name__", Value: name})
+	labels = append(labels, storage.InternLabel("__name__", name))
 
 	for k, v := range tags {
-		labels = append(labels, storage.Label{Name: k, Value: v})
+		labels = append(labels, storage.InternLabel(k, v))
 	}
 
 	// Sort for consistency using sort.Sort

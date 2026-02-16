@@ -152,9 +152,8 @@ func (es *EmbeddedScraper) scrapeTarget(config scraper.ScrapeConfig, staticConfi
 
 	// Build batch of DataPoints for direct TSDB write
 	points := make([]storage.DataPoint, 0, len(metrics))
-
 	for _, metric := range metrics {
-		// Build labels directly
+		// Build labels directly with string interning for memory efficiency
 		labels := make(storage.Labels, 0, len(metric.Labels)+len(config.Labels)+len(staticConfig.Labels)+2)
 
 		// Metric name
@@ -162,21 +161,21 @@ func (es *EmbeddedScraper) scrapeTarget(config scraper.ScrapeConfig, staticConfi
 		if config.MetricPrefix != "" {
 			metricName = config.MetricPrefix + "." + metricName
 		}
-		labels = append(labels, storage.Label{Name: "__name__", Value: metricName})
+		labels = append(labels, storage.InternLabel("__name__", metricName))
 
-		// Add all labels
+		// Add all labels with interning
 		for k, v := range config.Labels {
-			labels = append(labels, storage.Label{Name: k, Value: v})
+			labels = append(labels, storage.InternLabel(k, v))
 		}
 		for k, v := range staticConfig.Labels {
-			labels = append(labels, storage.Label{Name: k, Value: v})
+			labels = append(labels, storage.InternLabel(k, v))
 		}
 		for k, v := range metric.Labels {
-			labels = append(labels, storage.Label{Name: k, Value: v})
+			labels = append(labels, storage.InternLabel(k, v))
 		}
 		// Add job and instance
-		labels = append(labels, storage.Label{Name: "job", Value: config.JobName})
-		labels = append(labels, storage.Label{Name: "instance", Value: target})
+		labels = append(labels, storage.InternLabel("job", config.JobName))
+		labels = append(labels, storage.InternLabel("instance", target))
 
 		// IMPORTANT: Sort labels for consistent hashing and key generation
 		sort.Sort(labels)

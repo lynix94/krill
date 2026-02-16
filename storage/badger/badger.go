@@ -943,7 +943,7 @@ func serializeLabels(labels storage.Labels) []byte {
 	return buf.Bytes()
 }
 
-// deserializeLabels deserializes labels from bytes
+// deserializeLabels deserializes labels from bytes with string interning
 func deserializeLabels(data []byte) (storage.Labels, error) {
 	if len(data) == 0 {
 		return storage.Labels{}, nil
@@ -959,7 +959,7 @@ func deserializeLabels(data []byte) (storage.Labels, error) {
 
 	labels := make(storage.Labels, count)
 
-	// Read each label
+	// Read each label with string interning for memory efficiency
 	for i := uint32(0); i < count; i++ {
 		// Read name
 		var nameLen uint32
@@ -981,10 +981,8 @@ func deserializeLabels(data []byte) (storage.Labels, error) {
 			return nil, fmt.Errorf("failed to read label[%d] value: %w", i, err)
 		}
 
-		labels[i] = storage.Label{
-			Name:  string(nameBuf),
-			Value: string(valueBuf),
-		}
+		// Use string interning to reduce memory usage
+		labels[i] = storage.InternLabel(string(nameBuf), string(valueBuf))
 	}
 
 	return labels, nil

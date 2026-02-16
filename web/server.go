@@ -1,11 +1,13 @@
 package web
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/lynix/krill"
+	"github.com/lynix/krill/storage"
 )
 
 // Server represents the HTTP API server
@@ -39,9 +41,19 @@ func NewServer(opts ServerOptions) *Server {
 	mux.HandleFunc("/api/v1/write/batch", handler.HandleBatchWrite)
 	mux.HandleFunc("/api/v1/metrics", handler.HandleMetrics)
 	mux.HandleFunc("/api/v1/label/__name__/values", handler.HandleMetrics)
-	
+
 	// KrillQL API with JSON support for multiple queries
 	mux.HandleFunc("/api/v1/krillql", handler.HandleKrillQL)
+
+	// String pool statistics endpoint
+	mux.HandleFunc("/api/v1/stats/string_pool", func(w http.ResponseWriter, r *http.Request) {
+		stats := map[string]interface{}{
+			"unique_strings": storage.GlobalStringPool.Size(),
+			"description":    "Number of unique strings in the global string pool",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(stats)
+	})
 
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
