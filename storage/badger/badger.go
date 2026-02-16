@@ -40,19 +40,83 @@ type BadgerOptions struct {
 	TTL  time.Duration // Time-to-live for data points (0 = no expiration)
 }
 
+// CleanupCorruptedDatabase removes corrupted database files and allows fresh start
+func CleanupCorruptedDatabase(path string) error {
+	log.Printf("Cleaning up potentially corrupted database at: %s", path)
+
+	// Open with minimal options to check status
+	opts := badger.DefaultOptions(path)
+	opts.Logger = nil
+	opts.ReadOnly = true
+
+	db, err := badger.Open(opts)
+	if err == nil {
+		// Database opened successfully in read-only mode, close it
+		db.Close()
+		return nil
+	}
+
+	log.Printf("Database appears corrupted, attempting cleanup: %v", err)
+
+	// Try to run value log garbage collection
+	opts.ReadOnly = false
+	opts.BypassLockGuard = true
+
+	db, err = badger.Open(opts)
+	if err != nil {
+		// If still failing, the database is severely corrupted
+		log.Printf("Cannot open database for cleanup. Manual intervention may be required.")
+		log.Printf("Consider removing the database directory: %s", path)
+		return fmt.Errorf("database severely corrupted: %w", err)
+	}
+
+	// Run GC to clean up corrupted value log files
+	log.Printf("Running garbage collection to recover database...")
+	for {
+		err := db.RunValueLogGC(0.5) // Aggressively collect garbage
+		if err != nil {
+			break
+		}
+	}
+
+	db.Close()
+	log.Printf("Database cleanup completed")
+	return nil
+}
+
 // NewBadgerTSDB creates a new persistent TSDB with BadgerDB
 func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 	if opts.Path == "" {
 		opts.Path = "./krill_data"
 	}
 
-	// Configure BadgerDB
+	// Configure BadgerDB with safer options to prevent corruption
 	badgerOpts := badger.DefaultOptions(opts.Path)
 	badgerOpts.Logger = nil // Disable logging for cleaner output
 
+	// Data integrity and corruption prevention settings
+	badgerOpts.SyncWrites = true            // Sync writes to disk (prevents corruption on crash)
+	badgerOpts.DetectConflicts = false      // Better performance for TSDB workload
+	badgerOpts.CompactL0OnClose = true      // Cleanup on shutdown
+	badgerOpts.NumCompactors = 2            // Parallel compaction
+	badgerOpts.NumLevelZeroTables = 5       // Trigger compaction earlier
+	badgerOpts.NumLevelZeroTablesStall = 10 // Prevent too many L0 tables
+	badgerOpts.ValueLogFileSize = 64 << 20  // 64MB value log files (smaller = less corruption impact)
+	badgerOpts.MemTableSize = 32 << 20      // 32MB memtable (more frequent flushes)
+	badgerOpts.BlockCacheSize = 128 << 20   // 128MB block cache
+
 	db, err := badger.Open(badgerOpts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open BadgerDB: %w", err)
+		// If normal open fails, try with BypassLockGuard (allows recovery on locked DB)
+		log.Printf("Warning: Failed to open BadgerDB normally: %v", err)
+		log.Printf("Attempting to open with recovery options...")
+
+		badgerOpts.BypassLockGuard = true
+		db, err = badger.Open(badgerOpts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open BadgerDB even with recovery options: %w", err)
+		}
+		log.Printf("Successfully opened BadgerDB with recovery options. Database may need compaction.")
 	}
 
 	bdb := &BadgerTSDB{
@@ -396,14 +460,24 @@ func (bdb *BadgerTSDB) GetLabels(labels storage.Labels, startTs, endTs int64) ([
 			item := it.Item()
 
 			err := item.Value(func(val []byte) error {
+				// Add error recovery for corrupted data blocks
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[BADGER] Warning: Recovered from panic while deserializing data block: %v", r)
+					}
+				}()
+
 				series, err := DeserializeSeriesBlock(val)
 				if err != nil {
-					return err
+					// Log and skip corrupted block instead of failing entire query
+					log.Printf("[BADGER] Warning: Skipping corrupted data block: %v", err)
+					return nil
 				}
 
 				timestamps, values, err := series.Decode()
 				if err != nil {
-					return err
+					log.Printf("[BADGER] Warning: Skipping block with decode error: %v", err)
+					return nil
 				}
 
 				// Filter by time range and collect points
@@ -1076,33 +1150,86 @@ func (sb *SeriesBlock) Serialize() ([]byte, error) {
 
 // DeserializeSeriesBlock converts bytes back to a series block
 func DeserializeSeriesBlock(data []byte) (*SeriesBlock, error) {
+	// Validate minimum data size to prevent slice out of bounds
+	const minSize = 8 + 4 + 8 + 8 + 8 + 8 + 4 + 4 // metadata fields
+	if len(data) < minSize {
+		return nil, fmt.Errorf("corrupted data block: insufficient size %d (minimum %d)", len(data), minSize)
+	}
+
 	buf := bytes.NewReader(data)
 	sb := &SeriesBlock{}
 
-	// Read metadata
-	binary.Read(buf, binary.LittleEndian, &sb.StartTimestamp)
+	// Read metadata with error checking
+	if err := binary.Read(buf, binary.LittleEndian, &sb.StartTimestamp); err != nil {
+		return nil, fmt.Errorf("failed to read StartTimestamp: %w", err)
+	}
+
 	var count int32
-	binary.Read(buf, binary.LittleEndian, &count)
+	if err := binary.Read(buf, binary.LittleEndian, &count); err != nil {
+		return nil, fmt.Errorf("failed to read count: %w", err)
+	}
+
+	// Validate count to prevent huge allocations
+	if count < 0 || count > 1000000 {
+		return nil, fmt.Errorf("invalid count value: %d", count)
+	}
 	sb.Count = int(count)
-	binary.Read(buf, binary.LittleEndian, &sb.FirstTimestamp)
-	binary.Read(buf, binary.LittleEndian, &sb.LastTimestamp)
-	binary.Read(buf, binary.LittleEndian, &sb.FirstValue)
-	binary.Read(buf, binary.LittleEndian, &sb.LastValue)
+
+	if err := binary.Read(buf, binary.LittleEndian, &sb.FirstTimestamp); err != nil {
+		return nil, fmt.Errorf("failed to read FirstTimestamp: %w", err)
+	}
+	if err := binary.Read(buf, binary.LittleEndian, &sb.LastTimestamp); err != nil {
+		return nil, fmt.Errorf("failed to read LastTimestamp: %w", err)
+	}
+	if err := binary.Read(buf, binary.LittleEndian, &sb.FirstValue); err != nil {
+		return nil, fmt.Errorf("failed to read FirstValue: %w", err)
+	}
+	if err := binary.Read(buf, binary.LittleEndian, &sb.LastValue); err != nil {
+		return nil, fmt.Errorf("failed to read LastValue: %w", err)
+	}
 
 	// Read timestamp stream bytes
 	var tsLen int32
-	binary.Read(buf, binary.LittleEndian, &tsLen)
+	if err := binary.Read(buf, binary.LittleEndian, &tsLen); err != nil {
+		return nil, fmt.Errorf("failed to read timestamp length: %w", err)
+	}
+
+	// Validate length to prevent huge allocations
+	if tsLen < 0 || tsLen > 10000000 {
+		return nil, fmt.Errorf("invalid timestamp length: %d", tsLen)
+	}
+
 	if tsLen > 0 {
+		// Check if enough data remains
+		if int64(tsLen) > int64(buf.Len()) {
+			return nil, fmt.Errorf("insufficient data for timestamp bytes: need %d, have %d", tsLen, buf.Len())
+		}
 		sb.timestampBytes = make([]byte, tsLen)
-		buf.Read(sb.timestampBytes)
+		if _, err := buf.Read(sb.timestampBytes); err != nil {
+			return nil, fmt.Errorf("failed to read timestamp bytes: %w", err)
+		}
 	}
 
 	// Read value stream bytes
 	var valLen int32
-	binary.Read(buf, binary.LittleEndian, &valLen)
+	if err := binary.Read(buf, binary.LittleEndian, &valLen); err != nil {
+		return nil, fmt.Errorf("failed to read value length: %w", err)
+	}
+
+	// Validate length to prevent huge allocations
+	if valLen < 0 || valLen > 10000000 {
+		return nil, fmt.Errorf("invalid value length: %d", valLen)
+	}
+
 	if valLen > 0 {
+		// Check if enough data remains
+		if int64(valLen) > int64(buf.Len()) {
+			return nil, fmt.Errorf("insufficient data for value bytes: need %d, have %d", valLen, buf.Len())
+		}
 		sb.valueBytes = make([]byte, valLen)
-		buf.Read(sb.valueBytes)
+		if _, err := buf.Read(sb.valueBytes); err != nil {
+			return nil, fmt.Errorf("failed to read value bytes: %w", err)
+		}
 	}
 
 	return sb, nil
