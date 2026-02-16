@@ -831,6 +831,7 @@ func buildLabels(name string, tags map[string]string) storage.Labels {
 
 // parseMetricKey parses a metric key back into name and tags
 // Format: metric_name{tag1="value1",tag2="value2"}
+// Also supports: {"metric_name", tag1="value1"} (Grafana format)
 func parseMetricKey(key string) (string, map[string]string) {
 	tags := make(map[string]string)
 
@@ -841,7 +842,51 @@ func parseMetricKey(key string) (string, map[string]string) {
 		return key, tags
 	}
 
-	name := key[:bracePos]
+	var name string
+	
+	// Check if query starts with { (Grafana label matcher format)
+	if bracePos == 0 {
+		// Format: {"metric_name", cloud="apigw"}
+		// Find } position
+		endPos := strings.Index(key[bracePos:], "}")
+		if endPos < 0 {
+			return "", tags
+		}
+		endPos += bracePos
+
+		// Parse tags
+		tagStr := key[bracePos+1 : endPos]
+		if tagStr == "" {
+			return "", tags
+		}
+
+		// Split by comma
+		pairs := strings.Split(tagStr, ",")
+		for i, pair := range pairs {
+			pair = strings.TrimSpace(pair)
+			
+			// First element without = is the metric name
+			if i == 0 && !strings.Contains(pair, "=") {
+				// Remove quotes if present
+				name = strings.Trim(pair, "\"")
+				continue
+			}
+			
+			// Split by =
+			parts := strings.SplitN(pair, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			k := strings.TrimSpace(parts[0])
+			v := strings.Trim(strings.TrimSpace(parts[1]), "\"")
+			tags[k] = v
+		}
+		
+		return name, tags
+	}
+
+	// Standard format: metric_name{tag1="value1"}
+	name = key[:bracePos]
 
 	// Find } position
 	endPos := strings.Index(key[bracePos:], "}")
