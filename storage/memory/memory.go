@@ -53,15 +53,26 @@ func (ms *MemoryStorage) Put(ts int64, metric string, value float64) error {
 
 // PutBatch stores multiple time-series data points efficiently
 func (ms *MemoryStorage) PutBatch(points []storage.DataPoint) error {
-	// Group points by series ID for efficient processing
-	seriesPoints := make(map[uint64][]storage.DataPoint)
-	for _, point := range points {
-		seriesID := point.Labels.Hash()
-		seriesPoints[seriesID] = append(seriesPoints[seriesID], point)
+	// Group points by series ID
+	// Copy Labels to avoid holding references to original slice
+	type pointData struct {
+		timestamp int64
+		value     float64
+		labels    storage.Labels
+	}
+	seriesPoints := make(map[uint64][]pointData)
+	
+	for i := range points {
+		seriesID := points[i].Labels.Hash()
+		seriesPoints[seriesID] = append(seriesPoints[seriesID], pointData{
+			timestamp: points[i].Timestamp,
+			value:     points[i].Value,
+			labels:    points[i].Labels.Copy(), // Deep copy labels
+		})
 	}
 	
 	// Process each series
-	for seriesID, points := range seriesPoints {
+	for seriesID, pointsData := range seriesPoints {
 		ms.mu.Lock()
 		series, exists := ms.series[seriesID]
 		if !exists {
@@ -71,35 +82,35 @@ func (ms *MemoryStorage) PutBatch(points []storage.DataPoint) error {
 				valueStream:     gorilla.NewValueEncoder(),
 			}
 			ms.series[seriesID] = series
-			ms.labels[seriesID] = points[0].Labels.Copy()
+			ms.labels[seriesID] = pointsData[0].labels
 		}
 		ms.mu.Unlock()
 		
 		// Write all points for this series
 		series.mu.Lock()
-		for _, point := range points {
+		for _, pd := range pointsData {
 			if series.count == 0 {
-				series.firstTimestamp = point.Timestamp
-				series.lastTimestamp = point.Timestamp
-				series.firstValue = point.Value
-				series.lastValue = point.Value
+				series.firstTimestamp = pd.timestamp
+				series.lastTimestamp = pd.timestamp
+				series.firstValue = pd.value
+				series.lastValue = pd.value
 				series.count++
 				continue
 			}
 			
-			if point.Timestamp < series.lastTimestamp {
+			if pd.timestamp < series.lastTimestamp {
 				continue // Skip old data
 			}
-			if point.Timestamp == series.lastTimestamp {
+			if pd.timestamp == series.lastTimestamp {
 				continue // Skip duplicate
 			}
 			
-			delta := point.Timestamp - series.lastTimestamp
+			delta := pd.timestamp - series.lastTimestamp
 			series.timestampStream.Encode(delta)
-			series.valueStream.Encode(point.Value, series.lastValue)
+			series.valueStream.Encode(pd.value, series.lastValue)
 			
-			series.lastTimestamp = point.Timestamp
-			series.lastValue = point.Value
+			series.lastTimestamp = pd.timestamp
+			series.lastValue = pd.value
 			series.count++
 		}
 		series.mu.Unlock()

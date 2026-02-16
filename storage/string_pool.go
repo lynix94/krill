@@ -37,9 +37,11 @@ func (sp *StringPool) Intern(s string) string {
 		return existing
 	}
 
-	// Add to pool
-	sp.pool[s] = s
-	return s
+	// Add to pool with forced copy to avoid holding large buffer references
+	// string([]byte(s)) forces a new allocation, breaking ties to source buffers
+	internedCopy := string([]byte(s))
+	sp.pool[internedCopy] = internedCopy
+	return internedCopy
 }
 
 // Size returns the number of unique strings in the pool

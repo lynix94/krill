@@ -92,7 +92,13 @@ func (ls Labels) WithoutName() Labels {
 // Copy creates a deep copy of the labels
 func (ls Labels) Copy() Labels {
 	result := make(Labels, len(ls))
-	copy(result, ls)
+	for i := range ls {
+		// Force string copy to avoid holding references to large buffers
+		result[i] = Label{
+			Name:  string([]byte(ls[i].Name)),
+			Value: string([]byte(ls[i].Value)),
+		}
+	}
 	return result
 }
 

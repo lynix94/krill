@@ -1,6 +1,7 @@
 package krill
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log"
@@ -140,12 +141,28 @@ func (es *EmbeddedScraper) scrapeTarget(config scraper.ScrapeConfig, staticConfi
 		return
 	}
 
-	metrics, err := scraper.ParsePrometheusMetrics(strings.NewReader(string(body)))
+	// Parse metrics directly from bytes without string conversion
+	metrics, err := scraper.ParsePrometheusMetrics(bytes.NewReader(body))
 	if err != nil {
 		log.Printf("Error parsing metrics from %s: %v", target, err)
 		es.recordFailure()
 		return
 	}
+	
+	// Force copy all strings to break references to body buffer
+	// This allows body to be GC'd immediately
+	for i := range metrics {
+		metrics[i].Name = string([]byte(metrics[i].Name))
+		for k := range metrics[i].Labels {
+			key := string([]byte(k))
+			val := string([]byte(metrics[i].Labels[k]))
+			delete(metrics[i].Labels, k)
+			metrics[i].Labels[key] = val
+		}
+	}
+	
+	// Clear body reference to allow GC
+	body = nil
 
 	// Direct write to TSDB (NO HTTP/JSON overhead!)
 	now := time.Now().Unix()
@@ -196,14 +213,18 @@ func (es *EmbeddedScraper) scrapeTarget(config scraper.ScrapeConfig, staticConfi
 	}
 
 	// Direct batch write - bypasses ALL network overhead!
+	pointCount := len(points)
 	if err := es.tsdb.TsdbPutBatch(points); err != nil {
 		log.Printf("Error writing batch to TSDB: %v", err)
 		es.recordFailure()
 		return
 	}
 
-	es.recordSuccess(int64(len(points)))
-	log.Printf("Scraped %s: wrote %d metrics directly to TSDB (embedded)", target, len(points))
+	// Clear reference to allow GC
+	points = nil
+
+	es.recordSuccess(int64(pointCount))
+	log.Printf("Scraped %s: wrote %d metrics directly to TSDB (embedded)", target, pointCount)
 }
 
 func (es *EmbeddedScraper) recordSuccess(metricsCount int64) {
