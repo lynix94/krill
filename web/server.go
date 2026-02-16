@@ -24,6 +24,7 @@ type ServerOptions struct {
 	Addr       string // Listen address (e.g., ":9090")
 	TSDB       krill.QueryableDB
 	PrintQuery bool // Print all incoming requests for debugging
+	DebugIndex bool // Enable debug logging for index operations
 }
 
 // NewServer creates a new HTTP API server
@@ -33,6 +34,7 @@ func NewServer(opts ServerOptions) *Server {
 	}
 
 	handler := NewPrometheusHandler(opts.TSDB)
+	handler.debugIndex = opts.DebugIndex
 
 	mux := http.NewServeMux()
 

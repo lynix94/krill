@@ -32,12 +32,15 @@ type BadgerTSDB struct {
 	// Example: labelIndex["cpu"]["cpu0"] = [seriesID1, seriesID3, ...]
 	labelIndex   map[string]map[string][]uint64
 	labelIndexMu sync.RWMutex
+
+	debugIndex bool // Enable debug logging for index operations
 }
 
 // BadgerOptions contains configuration for BadgerTSDB
 type BadgerOptions struct {
-	Path string        // Directory path for database
-	TTL  time.Duration // Time-to-live for data points (0 = no expiration)
+	Path       string        // Directory path for database
+	TTL        time.Duration // Time-to-live for data points (0 = no expiration)
+	DebugIndex bool          // Enable debug logging for index operations
 }
 
 // CleanupCorruptedDatabase removes corrupted database files and allows fresh start
@@ -126,6 +129,7 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 		formattedMetrics: make(map[uint64]string),
 		metricsCacheTTL:  5 * time.Minute, // 5 minutes cache
 		labelIndex:       make(map[string]map[string][]uint64),
+		debugIndex:       opts.DebugIndex,
 	}
 
 	// Load all series labels from database
@@ -811,8 +815,10 @@ func (bdb *BadgerTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uin
 	bdb.labelIndexMu.RLock()
 	defer bdb.labelIndexMu.RUnlock()
 
-	log.Printf("[BADGER-INDEX] Searching with matchers: %v", labelMatchers)
-	log.Printf("[BADGER-INDEX] Index has %d label names", len(bdb.labelIndex))
+	if bdb.debugIndex {
+		log.Printf("[BADGER-INDEX] Searching with matchers: %v", labelMatchers)
+		log.Printf("[BADGER-INDEX] Index has %d label names", len(bdb.labelIndex))
+	}
 
 	// Find the smallest posting list to start with (optimization)
 	var smallestPosting []uint64
@@ -820,32 +826,40 @@ func (bdb *BadgerTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uin
 
 	for labelName, labelValue := range labelMatchers {
 		if valueMap, ok := bdb.labelIndex[labelName]; ok {
-			log.Printf("[BADGER-INDEX] Label %q has %d values", labelName, len(valueMap))
-			
-			// Debug: print all available values for this label
-			if labelName == "__name__" {
-				availableValues := make([]string, 0, len(valueMap))
-				for v := range valueMap {
-					availableValues = append(availableValues, v)
+			if bdb.debugIndex {
+				log.Printf("[BADGER-INDEX] Label %q has %d values", labelName, len(valueMap))
+				
+				// Debug: print all available values for this label
+				if labelName == "__name__" {
+					availableValues := make([]string, 0, len(valueMap))
+					for v := range valueMap {
+						availableValues = append(availableValues, v)
+					}
+					log.Printf("[BADGER-INDEX] Available values for __name__: %v", availableValues)
 				}
-				log.Printf("[BADGER-INDEX] Available values for __name__: %v", availableValues)
 			}
 			
 			if posting, ok := valueMap[labelValue]; ok {
-				log.Printf("[BADGER-INDEX] Label %q=%q has %d series", labelName, labelValue, len(posting))
+				if bdb.debugIndex {
+					log.Printf("[BADGER-INDEX] Label %q=%q has %d series", labelName, labelValue, len(posting))
+				}
 				if smallestSize == -1 || len(posting) < smallestSize {
 					smallestPosting = posting
 					smallestSize = len(posting)
 				}
 			} else {
 				// Label value not found - no matches
-				log.Printf("[BADGER-INDEX] Label value %q not found for label %q", labelValue, labelName)
-				log.Printf("[BADGER-INDEX] Searched for (len=%d, bytes=%v)", len(labelValue), []byte(labelValue))
+				if bdb.debugIndex {
+					log.Printf("[BADGER-INDEX] Label value %q not found for label %q", labelValue, labelName)
+					log.Printf("[BADGER-INDEX] Searched for (len=%d, bytes=%v)", len(labelValue), []byte(labelValue))
+				}
 				return nil
 			}
 		} else {
 			// Label name not found - no matches
-			log.Printf("[BADGER-INDEX] Label name %q not found in index", labelName)
+			if bdb.debugIndex {
+				log.Printf("[BADGER-INDEX] Label name %q not found in index", labelName)
+			}
 			return nil
 		}
 	}

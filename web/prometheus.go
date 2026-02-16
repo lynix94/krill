@@ -19,7 +19,8 @@ import (
 
 // PrometheusHandler handles Prometheus-compatible API requests
 type PrometheusHandler struct {
-	tsdb krill.QueryableDB
+	tsdb       krill.QueryableDB
+	debugIndex bool
 }
 
 // NewPrometheusHandler creates a new Prometheus API handler
@@ -350,9 +351,13 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 			allMatchers[k] = v
 		}
 
-		log.Printf("[INDEX-RANGE] Using index search with matchers: %v", allMatchers)
+		if ph.debugIndex {
+			log.Printf("[INDEX-RANGE] Using index search with matchers: %v", allMatchers)
+		}
 		seriesIDs := finder.FindSeriesByLabels(allMatchers)
-		log.Printf("[INDEX-RANGE] Found %d matching series IDs", len(seriesIDs))
+		if ph.debugIndex {
+			log.Printf("[INDEX-RANGE] Found %d matching series IDs", len(seriesIDs))
+		}
 
 		// Convert seriesIDs to Labels
 		if labelsGetter, ok := ph.tsdb.(LabelsGetter); ok {
@@ -363,13 +368,17 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 			}
 		} else {
 			// Fallback: get all series
-			log.Printf("[INDEX-RANGE] LabelsGetter not available, fallback to full scan")
+			if ph.debugIndex {
+				log.Printf("[INDEX-RANGE] LabelsGetter not available, fallback to full scan")
+			}
 			allSeries, err := ph.tsdb.GetAllSeries()
 			if err != nil {
 				ph.sendError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			log.Printf("[INDEX-RANGE] Full scan of %d series", len(allSeries))
+			if ph.debugIndex {
+				log.Printf("[INDEX-RANGE] Full scan of %d series", len(allSeries))
+			}
 			matchingSeries = allSeries
 		}
 	} else {

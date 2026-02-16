@@ -22,6 +22,7 @@ func main() {
 	memoryOnly := flag.Bool("memory", false, "Use memory-only storage (no persistence)")
 	scrapeConfig := flag.String("scrape", "", "Path to scraper config YAML file (enables embedded scraping for 10x+ performance)")
 	printQuery := flag.Bool("printQuery", false, "Print all incoming HTTP requests for debugging")
+	debugIndex := flag.Bool("debugIndex", false, "Enable debug logging for index operations")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -44,6 +45,7 @@ func main() {
 			PersistencePath: *dataDir,
 			CacheDuration:   *cacheDuration,
 			TTL:             *retention,
+			DebugIndex:      *debugIndex,
 		})
 		if err != nil {
 			log.Fatalf("Failed to create HybridTSDB: %v", err)
@@ -79,6 +81,7 @@ func main() {
 		Addr:       *addr,
 		TSDB:       tsdb,
 		PrintQuery: *printQuery,
+		DebugIndex: *debugIndex,
 	})
 
 	// Handle graceful shutdown

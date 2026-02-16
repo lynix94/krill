@@ -44,6 +44,7 @@ type HybridOptions struct {
 	AsyncWrites     bool          // Enable async disk writes for better performance (default: true)
 	FlushInterval   time.Duration // How often to flush async writes to disk (default: 5 seconds)
 	WriteQueueSize  int           // Size of async write queue (default: 1000)
+	DebugIndex      bool          // Enable debug logging for index operations
 }
 
 // NewHybridTSDB creates a new hybrid TSDB with memory cache and persistent storage
@@ -75,8 +76,9 @@ func NewHybridTSDB(opts HybridOptions) (*HybridTSDB, error) {
 
 	// Create persistent storage
 	persistStore, err := persistence.NewPersistenceStorage(badger.BadgerOptions{
-		Path: opts.PersistencePath,
-		TTL:  opts.TTL,
+		Path:       opts.PersistencePath,
+		TTL:        opts.TTL,
+		DebugIndex: opts.DebugIndex,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create persistent storage: %w", err)
