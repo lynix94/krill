@@ -5,14 +5,41 @@ import (
 	"github.com/lynix/krill/storage/badger"
 )
 
+// BadgerDB interface for both single and partitioned implementations
+type BadgerDB interface {
+	PutLabels(ts int64, labels storage.Labels, value float64) error
+	TsdbPut(ts int64, metric string, value float64) error
+	PutBatch(points []storage.DataPoint) error
+	TsdbPutBatch(points []storage.DataPoint) error
+	Get(metric string, startTs, endTs int64) ([]int64, []float64, error)
+	GetLabels(labels storage.Labels, startTs, endTs int64) ([]int64, []float64, error)
+	GetMetrics() ([]string, error)
+	GetAllSeries() ([]storage.Labels, error)
+	FindSeriesByLabels(labelMatchers map[string]string) []uint64
+	GetLabelsForSeriesID(seriesID uint64) (storage.Labels, bool)
+	Close() error
+	RunGC() error
+	SetMemoryCache(cache badger.MemoryCacheProvider)
+}
+
 // PersistenceStorage wraps BadgerDB for the Storage interface
 type PersistenceStorage struct {
-	db *badger.BadgerTSDB
+	db BadgerDB
 }
 
 // NewPersistenceStorage creates a new persistence storage
 func NewPersistenceStorage(opts badger.BadgerOptions) (*PersistenceStorage, error) {
-	db, err := badger.NewBadgerTSDB(opts)
+	var db BadgerDB
+	var err error
+	
+	if opts.Partitions > 0 {
+		// Use partitioned BadgerDB for parallel writes
+		db, err = badger.NewPartitionedBadgerTSDB(opts, opts.Partitions)
+	} else {
+		// Use single BadgerDB instance
+		db, err = badger.NewBadgerTSDB(opts)
+	}
+	
 	if err != nil {
 		return nil, err
 	}

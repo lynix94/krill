@@ -17,13 +17,14 @@ func main() {
 	// Command-line flags
 	addr := flag.String("addr", ":9090", "HTTP server listen address")
 	dataDir := flag.String("data", "/tmp/krill-data", "Data directory for persistent storage")
-	cacheDuration := flag.Duration("cache", 2*time.Hour, "Memory cache duration (e.g., 2h, 30m)")
+	bucketSize := flag.Duration("bucketSize", 2*time.Hour, "Bucket size (e.g., 2h, 1h, 30m). Memory cache keeps 1 bucket only.")
 	retention := flag.Duration("retention", 30*24*time.Hour, "Data retention period (e.g., 7d, 15d, 30d). Default: 30d")
 	memoryOnly := flag.Bool("memory", false, "Use memory-only storage (no persistence)")
 	scrapeConfig := flag.String("scrape", "", "Path to scraper config YAML file (enables embedded scraping for 10x+ performance)")
 	printQuery := flag.Bool("printQuery", false, "Print all incoming HTTP requests for debugging")
 	debugIndex := flag.Bool("debugIndex", false, "Enable debug logging for index operations")
 	chunkSize := flag.Int("chunkSize", 10000, "BadgerDB batch chunk size (default: 10000, larger = faster writes but more memory)")
+	partitions := flag.Int("partitions", 4, "Number of BadgerDB partitions for parallel writes (default: 4, 0 = disabled)")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -37,17 +38,20 @@ func main() {
 		log.Println("Using memory-only storage")
 		tsdb = krill.NewTSDB()
 	} else {
+		bucketSizeSeconds := int64(bucketSize.Seconds())
 		if *retention > 0 {
-			log.Printf("Using hybrid storage (cache: %v, retention: %v, data: %s)", *cacheDuration, *retention, *dataDir)
+			log.Printf("Using hybrid storage (bucket: %v, retention: %v, data: %s)", *bucketSize, *retention, *dataDir)
 		} else {
-			log.Printf("Using hybrid storage (cache: %v, no retention, data: %s)", *cacheDuration, *dataDir)
+			log.Printf("Using hybrid storage (bucket: %v, no retention, data: %s)", *bucketSize, *dataDir)
 		}
 		tsdb, err = krill.NewHybridTSDB(krill.HybridOptions{
 			PersistencePath: *dataDir,
-			CacheDuration:   *cacheDuration,
+			CacheDuration:   *bucketSize, // Memory cache keeps 1 bucket only
 			TTL:             *retention,
 			DebugIndex:      *debugIndex,
 			ChunkSize:       *chunkSize,
+			Partitions:      *partitions,
+			BucketSize:      bucketSizeSeconds,
 		})
 		if err != nil {
 			log.Fatalf("Failed to create HybridTSDB: %v", err)

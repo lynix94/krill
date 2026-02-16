@@ -36,6 +36,7 @@ type BadgerTSDB struct {
 	debugIndex   bool                   // Enable debug logging for index operations
 	chunkSize    int                    // Batch chunk size for transactions (default: 10000)
 	memoryCache  MemoryCacheProvider    // Optional: memory cache for zero-copy writes
+	bucketSize   int64                  // Bucket size in seconds (default: 3600 = 1 hour)
 }
 
 // MemoryCacheProvider interface for getting serialized blocks from memory cache
@@ -45,10 +46,12 @@ type MemoryCacheProvider interface {
 
 // BadgerOptions contains configuration for BadgerTSDB
 type BadgerOptions struct {
-	Path       string        // Directory path for database
-	TTL        time.Duration // Time-to-live for data points (0 = no expiration)
-	DebugIndex bool          // Enable debug logging for index operations
-	ChunkSize  int           // Batch chunk size for transactions (0 = use default 10000)
+	Path        string        // Directory path for database
+	TTL         time.Duration // Time-to-live for data points (0 = no expiration)
+	DebugIndex  bool          // Enable debug logging for index operations
+	ChunkSize   int           // Batch chunk size for transactions (0 = use default 10000)
+	Partitions  int           // Number of partitions (0 = no partitioning, 4 = recommended)
+	BucketSize  int64         // Bucket size in seconds (0 = use default 3600 = 1 hour)
 }
 
 // CleanupCorruptedDatabase removes corrupted database files and allows fresh start
@@ -139,12 +142,20 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 		labelIndex:       make(map[string]map[string][]uint64),
 		debugIndex:       opts.DebugIndex,
 		chunkSize:        opts.ChunkSize,
+		bucketSize:       opts.BucketSize,
 	}
 
 	// Set default chunk size if not specified
 	if bdb.chunkSize <= 0 {
 		bdb.chunkSize = 10000
 	}
+
+	// Set default bucket size if not specified (1 hour)
+	if bdb.bucketSize <= 0 {
+		bdb.bucketSize = 3600
+	}
+	
+	log.Printf("[BadgerDB] Initialized with bucketSize=%d seconds (%.1f hours)", bdb.bucketSize, float64(bdb.bucketSize)/3600.0)
 
 	// Load all series labels from database
 	if err := bdb.loadAllSeries(); err != nil {
@@ -198,8 +209,7 @@ func (bdb *BadgerTSDB) PutLabels(ts int64, labels storage.Labels, value float64)
 	}
 
 	// Create time-partitioned key: seriesID:timestamp_bucket
-	// Use hourly buckets for better read performance
-	bucket := ts / 3600 * 3600
+	bucket := ts / bdb.bucketSize * bdb.bucketSize
 	key := makeKeyFromID(seriesID, bucket)
 
 	return bdb.db.Update(func(txn *badger.Txn) error {
@@ -319,7 +329,7 @@ func (bdb *BadgerTSDB) writeBatchChunk(points []storage.DataPoint) error {
 	bdb.labelsMu.Lock()
 	for _, point := range points {
 		seriesID := point.Labels.Hash()
-		bucket := point.Timestamp / 3600 * 3600
+		bucket := point.Timestamp / bdb.bucketSize * bdb.bucketSize
 		key := bucketKey{seriesID, bucket}
 		bucketPoints[key] = append(bucketPoints[key], point)
 

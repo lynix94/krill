@@ -11,11 +11,13 @@ import (
 	"github.com/lynix/krill/storage/gorilla"
 )
 
-// MemoryStorage implements in-memory storage using Gorilla compression
+// MemoryStorage implements in-memory storage using Gorilla compression with configurable buckets
 type MemoryStorage struct {
 	mu      sync.RWMutex
-	series  map[uint64]*MetricSeries  // seriesID -> series
-	labels  map[uint64]storage.Labels // seriesID -> labels
+	buckets map[bucketKey]*MetricSeries // (seriesID, bucket) -> series
+	labels  map[uint64]storage.Labels   // seriesID -> labels
+	
+	bucketSize int64 // Bucket size in seconds (default: 3600 = 1 hour)
 	
 	// Cache for GetMetrics to avoid repeated formatting
 	metricsCache     []string
@@ -23,10 +25,17 @@ type MemoryStorage struct {
 	metricsCacheMu   sync.RWMutex
 }
 
-// MetricSeries stores compressed time-series data for a single metric
+// bucketKey identifies a series bucket
+type bucketKey struct {
+	seriesID uint64
+	bucket   int64 // Unix timestamp rounded to bucketSize
+}
+
+// MetricSeries stores compressed time-series data for a single metric bucket
 type MetricSeries struct {
 	mu              sync.Mutex
 	id              uint64
+	bucket          int64 // Bucket start timestamp
 	firstTimestamp  int64
 	lastTimestamp   int64
 	firstValue      float64
@@ -36,11 +45,21 @@ type MetricSeries struct {
 	count           int
 }
 
-// NewMemoryStorage creates a new in-memory storage
+// NewMemoryStorage creates a new in-memory storage with default 1-hour buckets
 func NewMemoryStorage() *MemoryStorage {
+	return NewMemoryStorageWithBucketSize(3600)
+}
+
+// NewMemoryStorageWithBucketSize creates a new in-memory storage with custom bucket size
+func NewMemoryStorageWithBucketSize(bucketSize int64) *MemoryStorage {
+	if bucketSize <= 0 {
+		bucketSize = 3600 // Default to 1 hour
+	}
+	fmt.Printf("[MemoryStorage] Initialized with bucketSize=%d seconds (%.1f hours)\n", bucketSize, float64(bucketSize)/3600.0)
 	return &MemoryStorage{
-		series: make(map[uint64]*MetricSeries),
-		labels: make(map[uint64]storage.Labels),
+		buckets:    make(map[bucketKey]*MetricSeries),
+		labels:     make(map[uint64]storage.Labels),
+		bucketSize: bucketSize,
 	}
 }
 
@@ -53,42 +72,44 @@ func (ms *MemoryStorage) Put(ts int64, metric string, value float64) error {
 	return ms.PutLabels(ts, labels, value)
 }
 
-// PutBatch stores multiple time-series data points efficiently
+// PutBatch stores multiple time-series data points efficiently with 1-hour buckets
 func (ms *MemoryStorage) PutBatch(points []storage.DataPoint) error {
-	// Group points by series ID
-	// Copy Labels to avoid holding references to original slice
+	// Group points by (seriesID, bucket)
 	type pointData struct {
 		timestamp int64
 		value     float64
 		labels    storage.Labels
 	}
-	seriesPoints := make(map[uint64][]pointData)
+	bucketPoints := make(map[bucketKey][]pointData)
 	
 	for i := range points {
 		seriesID := points[i].Labels.Hash()
-		seriesPoints[seriesID] = append(seriesPoints[seriesID], pointData{
+		bucket := points[i].Timestamp / ms.bucketSize * ms.bucketSize
+		bkey := bucketKey{seriesID: seriesID, bucket: bucket}
+		bucketPoints[bkey] = append(bucketPoints[bkey], pointData{
 			timestamp: points[i].Timestamp,
 			value:     points[i].Value,
 			labels:    points[i].Labels.Copy(), // Deep copy labels
 		})
 	}
 	
-	// Process each series
-	for seriesID, pointsData := range seriesPoints {
+	// Process each bucket
+	for bkey, pointsData := range bucketPoints {
 		ms.mu.Lock()
-		series, exists := ms.series[seriesID]
+		series, exists := ms.buckets[bkey]
 		if !exists {
 			series = &MetricSeries{
-				id:              seriesID,
+				id:              bkey.seriesID,
+				bucket:          bkey.bucket,
 				timestampStream: gorilla.NewTimestampEncoder(),
 				valueStream:     gorilla.NewValueEncoder(),
 			}
-			ms.series[seriesID] = series
-			ms.labels[seriesID] = pointsData[0].labels
+			ms.buckets[bkey] = series
+			ms.labels[bkey.seriesID] = pointsData[0].labels
 		}
 		ms.mu.Unlock()
 		
-		// Write all points for this series
+		// Write all points for this bucket
 		series.mu.Lock()
 		for _, pd := range pointsData {
 			if series.count == 0 {
@@ -126,19 +147,22 @@ func (ms *MemoryStorage) PutBatch(points []storage.DataPoint) error {
 	return nil
 }
 
-// PutLabels stores a time-series data point using Labels
+// PutLabels stores a time-series data point using Labels with configurable buckets
 func (ms *MemoryStorage) PutLabels(ts int64, labels storage.Labels, value float64) error {
 	seriesID := labels.Hash()
+	bucket := ts / ms.bucketSize * ms.bucketSize
+	bkey := bucketKey{seriesID: seriesID, bucket: bucket}
 	
 	ms.mu.Lock()
-	series, exists := ms.series[seriesID]
+	series, exists := ms.buckets[bkey]
 	if !exists {
 		series = &MetricSeries{
 			id:              seriesID,
+			bucket:          bucket,
 			timestampStream: gorilla.NewTimestampEncoder(),
 			valueStream:     gorilla.NewValueEncoder(),
 		}
-		ms.series[seriesID] = series
+		ms.buckets[bkey] = series
 		ms.labels[seriesID] = labels.Copy()
 		
 		// Invalidate metrics cache when new series added
@@ -194,87 +218,90 @@ func (ms *MemoryStorage) Get(metric string, startTs, endTs int64) ([]int64, []fl
 	return ms.GetLabels(labels, startTs, endTs)
 }
 
-// GetLabels retrieves all data points for labels within a time range
+// GetLabels retrieves all data points for labels within a time range across all buckets
 func (ms *MemoryStorage) GetLabels(labels storage.Labels, startTs, endTs int64) ([]int64, []float64, error) {
 	seriesID := labels.Hash()
 	
-	ms.mu.RLock()
-	series, exists := ms.series[seriesID]
-	ms.mu.RUnlock()
+	// Calculate bucket range
+	startBucket := startTs / ms.bucketSize * ms.bucketSize
+	endBucket := endTs / ms.bucketSize * ms.bucketSize
+	
+	allTimestamps := []int64{}
+	allValues := []float64{}
+	
+	// Iterate through all relevant buckets
+	for bucket := startBucket; bucket <= endBucket; bucket += ms.bucketSize {
+		bkey := bucketKey{seriesID: seriesID, bucket: bucket}
+		
+		ms.mu.RLock()
+		series, exists := ms.buckets[bkey]
+		ms.mu.RUnlock()
 
-	if !exists {
-		return nil, nil, fmt.Errorf("series not found")
+		if !exists || series.count == 0 {
+			continue
+		}
+
+		series.mu.Lock()
+		
+		timestamps := make([]int64, 0, series.count)
+		values := make([]float64, 0, series.count)
+
+		// First value
+		timestamps = append(timestamps, series.firstTimestamp)
+		values = append(values, series.firstValue)
+
+		if series.count > 1 {
+			// Decode remaining values
+			timestampDecoder := gorilla.NewTimestampDecoder(series.timestampStream.Bytes())
+			valueDecoder := gorilla.NewValueDecoder(series.valueStream.Bytes())
+
+			currentTimestamp := series.firstTimestamp
+			currentValue := series.firstValue
+
+			for i := 1; i < series.count; i++ {
+				delta, err := timestampDecoder.Decode()
+				if err != nil {
+					series.mu.Unlock()
+					return nil, nil, fmt.Errorf("failed to decode timestamp: %v", err)
+				}
+				currentTimestamp += delta
+				timestamps = append(timestamps, currentTimestamp)
+
+				value, err := valueDecoder.Decode(currentValue)
+				if err != nil {
+					series.mu.Unlock()
+					return nil, nil, fmt.Errorf("failed to decode value: %v", err)
+				}
+				currentValue = value
+				values = append(values, value)
+			}
+		}
+		
+		series.mu.Unlock()
+		
+		// Filter by time range
+		for i, ts := range timestamps {
+			if ts >= startTs && ts <= endTs {
+				allTimestamps = append(allTimestamps, ts)
+				allValues = append(allValues, values[i])
+			}
+		}
 	}
 
-	series.mu.Lock()
-	defer series.mu.Unlock()
-
-	if series.count == 0 {
+	if len(allTimestamps) == 0 {
 		return []int64{}, []float64{}, nil
 	}
 
-	timestamps := make([]int64, 0, series.count)
-	values := make([]float64, 0, series.count)
-
-	// First value
-	timestamps = append(timestamps, series.firstTimestamp)
-	values = append(values, series.firstValue)
-
-	if series.count == 1 {
-		if startTs > 0 && (series.firstTimestamp < startTs || series.firstTimestamp > endTs) {
-			return []int64{}, []float64{}, nil
-		}
-		return timestamps, values, nil
-	}
-
-	// Decode remaining values
-	timestampDecoder := gorilla.NewTimestampDecoder(series.timestampStream.Bytes())
-	valueDecoder := gorilla.NewValueDecoder(series.valueStream.Bytes())
-
-	currentTimestamp := series.firstTimestamp
-	currentValue := series.firstValue
-
-	for i := 1; i < series.count; i++ {
-		delta, err := timestampDecoder.Decode()
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to decode timestamp: %v", err)
-		}
-		currentTimestamp += delta
-		timestamps = append(timestamps, currentTimestamp)
-
-		value, err := valueDecoder.Decode(currentValue)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to decode value: %v", err)
-		}
-		currentValue = value
-		values = append(values, value)
-	}
-
-	// Filter by time range if specified
-	if startTs > 0 || endTs > 0 {
-		if endTs == 0 {
-			endTs = 1<<63 - 1 // Max int64
-		}
-		filteredTimestamps := make([]int64, 0)
-		filteredValues := make([]float64, 0)
-		for i, ts := range timestamps {
-			if ts >= startTs && ts <= endTs {
-				filteredTimestamps = append(filteredTimestamps, ts)
-				filteredValues = append(filteredValues, values[i])
-			}
-		}
-		return filteredTimestamps, filteredValues, nil
-	}
-
-	return timestamps, values, nil
+	return allTimestamps, allValues, nil
 }
 
 // GetSerializedBlock returns a serialized block for a series bucket (for direct BadgerDB write)
-// This allows BadgerDB to write memory cache data without decompression/recompression
-// Returns nil if series doesn't exist or has no data in the bucket timerange
+// With bucket-based storage, this simply serializes the exact bucket data
 func (ms *MemoryStorage) GetSerializedBlock(seriesID uint64, bucketStart int64) []byte {
+	bkey := bucketKey{seriesID: seriesID, bucket: bucketStart}
+	
 	ms.mu.RLock()
-	series, exists := ms.series[seriesID]
+	series, exists := ms.buckets[bkey]
 	ms.mu.RUnlock()
 
 	if !exists || series.count == 0 {
@@ -284,33 +311,25 @@ func (ms *MemoryStorage) GetSerializedBlock(seriesID uint64, bucketStart int64) 
 	series.mu.Lock()
 	defer series.mu.Unlock()
 
-	bucketEnd := bucketStart + 3600
-	
-	// Check if series data overlaps with bucket
-	if series.lastTimestamp < bucketStart || series.firstTimestamp >= bucketEnd {
-		return nil // Series has no data in this bucket
-	}
-
-	// Serialize the series block in BadgerDB format
-	// We need to include: SeriesID, StartTimestamp, Count, First/Last timestamps/values, compressed bytes
+	// Serialize the series block in BadgerDB format (MUST use LittleEndian!)
+	// Since memory cache uses same bucket size, data is already aligned
 	buf := new(bytes.Buffer)
 	
-	// Write header (same format as BadgerDB SeriesBlock.Serialize)
-	binary.Write(buf, binary.BigEndian, seriesID)
-	binary.Write(buf, binary.BigEndian, bucketStart)
-	binary.Write(buf, binary.BigEndian, int32(series.count))
-	binary.Write(buf, binary.BigEndian, series.firstTimestamp)
-	binary.Write(buf, binary.BigEndian, series.lastTimestamp)
-	binary.Write(buf, binary.BigEndian, series.firstValue)
-	binary.Write(buf, binary.BigEndian, series.lastValue)
+	// Write header - Note: BadgerDB uses LittleEndian, not BigEndian!
+	binary.Write(buf, binary.LittleEndian, bucketStart)      // StartTimestamp
+	binary.Write(buf, binary.LittleEndian, int32(series.count))
+	binary.Write(buf, binary.LittleEndian, series.firstTimestamp)
+	binary.Write(buf, binary.LittleEndian, series.lastTimestamp)
+	binary.Write(buf, binary.LittleEndian, series.firstValue)
+	binary.Write(buf, binary.LittleEndian, series.lastValue)
 	
 	// Write compressed data
 	timestampBytes := series.timestampStream.Bytes()
 	valueBytes := series.valueStream.Bytes()
 	
-	binary.Write(buf, binary.BigEndian, int32(len(timestampBytes)))
+	binary.Write(buf, binary.LittleEndian, int32(len(timestampBytes)))
 	buf.Write(timestampBytes)
-	binary.Write(buf, binary.BigEndian, int32(len(valueBytes)))
+	binary.Write(buf, binary.LittleEndian, int32(len(valueBytes)))
 	buf.Write(valueBytes)
 	
 	return buf.Bytes()
@@ -330,8 +349,8 @@ func (ms *MemoryStorage) GetMetrics() ([]string, error) {
 
 	// Cache miss or expired, rebuild
 	ms.mu.RLock()
-	metrics := make([]string, 0, len(ms.series))
-	for seriesID := range ms.series {
+	metrics := make([]string, 0, len(ms.labels))
+	for seriesID := range ms.labels {
 		labels := ms.labels[seriesID]
 		metrics = append(metrics, formatLabelsAsMetricString(labels))
 	}
@@ -363,29 +382,29 @@ func (ms *MemoryStorage) Close() error {
 	return nil
 }
 
-// DeleteOlderThan removes data points older than the specified timestamp
+// DeleteOlderThan removes buckets older than the specified timestamp
 func (ms *MemoryStorage) DeleteOlderThan(cutoffTs int64) error {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
-	toDelete := make([]uint64, 0)
+	cutoffBucket := cutoffTs / ms.bucketSize * ms.bucketSize
+	toDelete := make([]bucketKey, 0)
 	
-	for seriesID, series := range ms.series {
+	for bkey, series := range ms.buckets {
 		series.mu.Lock()
-		if series.lastTimestamp < cutoffTs {
-			// Entire series is old, delete it
-			toDelete = append(toDelete, seriesID)
+		// Delete entire bucket if it's older than cutoff
+		if bkey.bucket < cutoffBucket {
+			toDelete = append(toDelete, bkey)
 		}
 		series.mu.Unlock()
 	}
 
-	for _, seriesID := range toDelete {
-		delete(ms.series, seriesID)
-		delete(ms.labels, seriesID)
+	for _, bkey := range toDelete {
+		delete(ms.buckets, bkey)
 	}
 
 	if len(toDelete) > 0 {
-		fmt.Printf("Cleaned up %d series from memory cache (older than %d)\n", len(toDelete), cutoffTs)
+		fmt.Printf("Cleaned up %d buckets from memory cache (older than %d)\n", len(toDelete), cutoffTs)
 	}
 
 	return nil
@@ -512,33 +531,35 @@ func trimQuotes(s string) string {
 	return s
 }
 
-// GetSeries returns the metric series for testing purposes (legacy)
+// GetSeries returns the metric series for testing purposes (returns first found bucket)
 func (ms *MemoryStorage) GetSeries(metric string) *PublicMetricSeries {
 	name, tags := parseMetricString(metric)
 	labels := storage.LabelsFromMap(name, tags)
 	seriesID := labels.Hash()
 	
 	ms.mu.RLock()
-	series, exists := ms.series[seriesID]
-	ms.mu.RUnlock()
+	defer ms.mu.RUnlock()
 	
-	if !exists {
-		return nil
+	// Find first bucket for this series
+	for bkey, series := range ms.buckets {
+		if bkey.seriesID == seriesID {
+			series.mu.Lock()
+			defer series.mu.Unlock()
+			
+			return &PublicMetricSeries{
+				Name:            formatLabelsAsMetricString(labels),
+				FirstTimestamp:  series.firstTimestamp,
+				LastTimestamp:   series.lastTimestamp,
+				FirstValue:      series.firstValue,
+				LastValue:       series.lastValue,
+				TimestampStream: series.timestampStream,
+				ValueStream:     series.valueStream,
+				Count:           series.count,
+			}
+		}
 	}
 	
-	series.mu.Lock()
-	defer series.mu.Unlock()
-	
-	return &PublicMetricSeries{
-		Name:            formatLabelsAsMetricString(labels),
-		FirstTimestamp:  series.firstTimestamp,
-		LastTimestamp:   series.lastTimestamp,
-		FirstValue:      series.firstValue,
-		LastValue:       series.lastValue,
-		TimestampStream: series.timestampStream,
-		ValueStream:     series.valueStream,
-		Count:           series.count,
-	}
+	return nil
 }
 
 // PublicMetricSeries is a public view of MetricSeries for testing

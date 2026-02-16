@@ -15,7 +15,7 @@ import (
 // HybridTSDB combines memory cache and persistent storage
 // Recent data (default 2 hours) is cached in memory for fast access
 type HybridTSDB struct {
-	memoryCache      storage.Storage
+	memoryCache      *memory.MemoryStorage
 	persistStorage   storage.Storage
 	cacheDuration    time.Duration
 	cleanupInterval  time.Duration
@@ -46,6 +46,8 @@ type HybridOptions struct {
 	WriteQueueSize  int           // Size of async write queue (default: 1000)
 	DebugIndex      bool          // Enable debug logging for index operations
 	ChunkSize       int           // BadgerDB batch chunk size (0 = use default 10000)
+	Partitions      int           // Number of BadgerDB partitions for parallel writes (0 = no partitioning, 4 = recommended)
+	BucketSize      int64         // Bucket size in seconds (0 = use default 3600 = 1 hour)
 }
 
 // NewHybridTSDB creates a new hybrid TSDB with memory cache and persistent storage
@@ -72,8 +74,13 @@ func NewHybridTSDB(opts HybridOptions) (*HybridTSDB, error) {
 		asyncWrites = false
 	}
 
-	// Create memory cache
-	memCache := memory.NewMemoryStorage()
+	// Create memory cache with matching bucket size
+	var memCache *memory.MemoryStorage
+	if opts.BucketSize > 0 {
+		memCache = memory.NewMemoryStorageWithBucketSize(opts.BucketSize)
+	} else {
+		memCache = memory.NewMemoryStorage() // Default 3600
+	}
 
 	// Create persistent storage
 	persistStore, err := persistence.NewPersistenceStorage(badger.BadgerOptions{
@@ -81,6 +88,8 @@ func NewHybridTSDB(opts HybridOptions) (*HybridTSDB, error) {
 		TTL:        opts.TTL,
 		DebugIndex: opts.DebugIndex,
 		ChunkSize:  opts.ChunkSize,
+		Partitions: opts.Partitions,
+		BucketSize: opts.BucketSize,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create persistent storage: %w", err)
@@ -591,10 +600,8 @@ func (h *HybridTSDB) cleanupOldCache() {
 	now := time.Now().Unix()
 	cutoff := now - int64(h.cacheDuration.Seconds())
 
-	// Type assertion to access memory-specific methods
-	if memStorage, ok := h.memoryCache.(*memory.MemoryStorage); ok {
-		memStorage.DeleteOlderThan(cutoff)
-	}
+	// Direct access since memoryCache is now concrete type
+	h.memoryCache.DeleteOlderThan(cutoff)
 }
 
 // RunGC runs garbage collection on persistent storage
