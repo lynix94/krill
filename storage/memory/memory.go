@@ -324,6 +324,10 @@ func (ms *MemoryStorage) DeleteOlderThan(cutoffTs int64) error {
 		delete(ms.labels, seriesID)
 	}
 
+	if len(toDelete) > 0 {
+		fmt.Printf("Cleaned up %d series from memory cache (older than %d)\n", len(toDelete), cutoffTs)
+	}
+
 	return nil
 }
 
