@@ -20,6 +20,7 @@ func main() {
 	cacheDuration := flag.Duration("cache", 2*time.Hour, "Memory cache duration (e.g., 2h, 30m)")
 	memoryOnly := flag.Bool("memory", false, "Use memory-only storage (no persistence)")
 	scrapeConfig := flag.String("scrape", "", "Path to scraper config YAML file (enables embedded scraping for 10x+ performance)")
+	printQuery := flag.Bool("printQuery", false, "Print all incoming HTTP requests for debugging")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -67,9 +68,11 @@ func main() {
 	}
 
 	// Create and start web server
+	// Create web server
 	server := web.NewServer(web.ServerOptions{
-		Addr: *addr,
-		TSDB: tsdb,
+		Addr:       *addr,
+		TSDB:       tsdb,
+		PrintQuery: *printQuery,
 	})
 
 	// Handle graceful shutdown
@@ -88,7 +91,7 @@ func main() {
 	// Start server
 	now := time.Now().Unix()
 	log.Printf("Server listening on %s", *addr)
-	
+
 	if embeddedScraper != nil {
 		log.Println("\n🚀 Performance Mode: EMBEDDED SCRAPER ACTIVE")
 		log.Println("  ✓ Zero HTTP/JSON overhead")
@@ -96,7 +99,7 @@ func main() {
 		log.Println("  ✓ 10x+ faster than external scraper")
 		log.Println("  ✓ Single process (easier to manage)")
 	}
-	
+
 	log.Println("\nAPI Endpoints:")
 	log.Printf("  - http://localhost%s/", *addr)
 	log.Printf("  - http://localhost%s/api/v1/query?query=cpu.usage", *addr)

@@ -78,14 +78,23 @@ type KrillQLRequest struct {
 	Queries []KrillQLQuery `json:"queries"`
 }
 
-// HandleQuery handles instant queries: GET /api/v1/query
+// HandleQuery handles instant queries: GET or POST /api/v1/query
 func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	// Support both GET and POST methods (Grafana uses both)
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	query := r.URL.Query().Get("query")
+	// Parse query from URL params (GET) or form data (POST)
+	var query string
+	if r.Method == http.MethodPost {
+		r.ParseForm()
+		query = r.FormValue("query")
+	} else {
+		query = r.URL.Query().Get("query")
+	}
+	
 	if query == "" {
 		ph.sendError(w, http.StatusBadRequest, "query parameter is required")
 		return
@@ -93,6 +102,9 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 
 	// Parse time parameter (default to now)
 	timeParam := r.URL.Query().Get("time")
+	if r.Method == http.MethodPost && timeParam == "" {
+		timeParam = r.FormValue("time")
+	}
 	queryTime := time.Now().Unix()
 	if timeParam != "" {
 		t, err := strconv.ParseInt(timeParam, 10, 64)
@@ -533,6 +545,8 @@ func (ph *PrometheusHandler) HandleBatchWrite(w http.ResponseWriter, r *http.Req
 }
 
 // HandleMetrics returns list of all metrics: GET /api/v1/label/__name__/values or GET /api/v1/metrics
+// When called via /api/v1/label/__name__/values (Grafana), returns just metric names
+// When called via /api/v1/metrics, returns full metric strings with labels
 // Supports optional query parameters:
 //   - filter: regex pattern to filter metrics
 //   - limit: maximum number of metrics to return (default: no limit)
@@ -542,6 +556,9 @@ func (ph *PrometheusHandler) HandleMetrics(w http.ResponseWriter, r *http.Reques
 		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+
+	// Check if this is a Grafana label values request
+	isLabelValuesRequest := strings.Contains(r.URL.Path, "/label/__name__/values")
 
 	// Get query parameters
 	filterParam := r.URL.Query().Get("filter")
@@ -568,32 +585,57 @@ func (ph *PrometheusHandler) HandleMetrics(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	// Get all metrics from TSDB
-	allMetrics, err := ph.tsdb.GetMetrics()
-	if err != nil {
-		ph.sendError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
 	var filteredMetrics []string
 
-	// Apply filter if specified
-	if filterParam == "" {
-		filteredMetrics = allMetrics
+	if isLabelValuesRequest {
+		// Grafana label values request - return just metric names
+		allSeries, err := ph.tsdb.GetAllSeries()
+		if err != nil {
+			ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get series: %v", err))
+			return
+		}
+
+		// Extract unique metric names
+		metricNames := make(map[string]bool)
+		for _, series := range allSeries {
+			for _, label := range series {
+				if label.Name == "__name__" {
+					metricNames[label.Value] = true
+					break
+				}
+			}
+		}
+
+		// Convert to sorted slice
+		for name := range metricNames {
+			filteredMetrics = append(filteredMetrics, name)
+		}
+		sort.Strings(filteredMetrics)
 	} else {
-		// Compile regex filter
+		// Regular metrics request - return full metric strings
+		allMetrics, err := ph.tsdb.GetMetrics()
+		if err != nil {
+			ph.sendError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		filteredMetrics = allMetrics
+	}
+
+	// Apply filter if specified
+	if filterParam != "" {
 		filterRegex, err := regexp.Compile(filterParam)
 		if err != nil {
 			ph.sendError(w, http.StatusBadRequest, fmt.Sprintf("invalid filter regex: %v", err))
 			return
 		}
 
-		// Filter metrics using regex
-		for _, metric := range allMetrics {
+		var filtered []string
+		for _, metric := range filteredMetrics {
 			if filterRegex.MatchString(metric) {
-				filteredMetrics = append(filteredMetrics, metric)
+				filtered = append(filtered, metric)
 			}
 		}
+		filteredMetrics = filtered
 	}
 
 	totalCount := len(filteredMetrics)
@@ -611,20 +653,141 @@ func (ph *PrometheusHandler) HandleMetrics(w http.ResponseWriter, r *http.Reques
 
 	paginatedMetrics := filteredMetrics[start:end]
 
-	// Send response with pagination metadata
-	response := map[string]interface{}{
-		"status": "success",
-		"data":   paginatedMetrics,
-		"metadata": map[string]interface{}{
-			"total":  totalCount,
-			"offset": offset,
-			"limit":  limit,
-			"count":  len(paginatedMetrics),
-		},
+	// Send response
+	if isLabelValuesRequest {
+		// Grafana expects simple Prometheus response format
+		ph.sendSuccess(w, paginatedMetrics)
+	} else {
+		// Full response with pagination metadata for dashboard
+		response := map[string]interface{}{
+			"status": "success",
+			"data":   paginatedMetrics,
+			"metadata": map[string]interface{}{
+				"total":  totalCount,
+				"offset": offset,
+				"limit":  limit,
+				"count":  len(paginatedMetrics),
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	}
+}
+
+// HandleLabels returns all label names (Grafana API)
+// GET /api/v1/labels
+func (ph *PrometheusHandler) HandleLabels(w http.ResponseWriter, r *http.Request) {
+	allSeries, err := ph.tsdb.GetAllSeries()
+	if err != nil {
+		ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get series: %v", err))
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	labelNames := make(map[string]bool)
+	for _, series := range allSeries {
+		for _, label := range series {
+			labelNames[label.Name] = true
+		}
+	}
+
+	result := make([]string, 0, len(labelNames))
+	for name := range labelNames {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+
+	ph.sendSuccess(w, result)
+}
+
+// HandleLabelValues returns all values for a specific label (Grafana API)
+// GET /api/v1/label/<label_name>/values
+func (ph *PrometheusHandler) HandleLabelValues(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/label/"), "/")
+	if len(parts) < 2 || parts[1] != "values" {
+		ph.sendError(w, http.StatusBadRequest, "invalid URL format, expected /api/v1/label/<name>/values")
+		return
+	}
+	labelName := parts[0]
+
+	allSeries, err := ph.tsdb.GetAllSeries()
+	if err != nil {
+		ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get series: %v", err))
+		return
+	}
+
+	labelValues := make(map[string]bool)
+	for _, series := range allSeries {
+		for _, label := range series {
+			if label.Name == labelName {
+				labelValues[label.Value] = true
+			}
+		}
+	}
+
+	result := make([]string, 0, len(labelValues))
+	for value := range labelValues {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+
+	ph.sendSuccess(w, result)
+}
+
+// HandleSeries returns series metadata matching label matchers (Grafana API)
+// GET /api/v1/series?match[]=<matcher>
+func (ph *PrometheusHandler) HandleSeries(w http.ResponseWriter, r *http.Request) {
+	matches := r.URL.Query()["match[]"]
+	if len(matches) == 0 {
+		ph.sendError(w, http.StatusBadRequest, "at least one match[] parameter required")
+		return
+	}
+
+	allSeries, err := ph.tsdb.GetAllSeries()
+	if err != nil {
+		ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get series: %v", err))
+		return
+	}
+
+	type SeriesMeta struct {
+		Metric map[string]string `json:"metric"`
+	}
+
+	var result []SeriesMeta
+	for _, series := range allSeries {
+		labelsMap := make(map[string]string)
+		for _, label := range series {
+			labelsMap[label.Name] = label.Value
+		}
+
+		for _, match := range matches {
+			if matchesSimpleSelector(labelsMap, match) {
+				result = append(result, SeriesMeta{Metric: labelsMap})
+				break
+			}
+		}
+	}
+
+	ph.sendSuccess(w, result)
+}
+
+// matchesSimpleSelector checks if labels match a Prometheus selector
+func matchesSimpleSelector(labels map[string]string, selector string) bool {
+	selector = strings.TrimSpace(selector)
+
+	if !strings.Contains(selector, "{") {
+		metricName, ok := labels["__name__"]
+		return ok && metricName == selector
+	}
+
+	var metricName string
+	if idx := strings.Index(selector, "{"); idx > 0 {
+		metricName = selector[:idx]
+		if labelValue, ok := labels["__name__"]; !ok || labelValue != metricName {
+			return false
+		}
+	}
+
+	return true // Simplified: just check metric name
 }
 
 // buildMetricKey creates a metric key with tags
