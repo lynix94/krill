@@ -203,6 +203,15 @@ const dashboardHTML = `<!DOCTYPE html>
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+        .spinner {
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            border: 4px solid rgba(102, 126, 234, 0.3);
+            border-radius: 50%;
+            border-top-color: #667eea;
+            animation: spin 1s ease-in-out infinite;
+        }
         .tabs {
             display: flex;
             background: white;
@@ -894,15 +903,40 @@ const dashboardHTML = `<!DOCTYPE html>
 
         // Metrics List Functions
         let cachedMetrics = [];
+        let currentPage = 1;
+        const pageSize = 100; // Show 100 metrics per page
         
         async function loadAllMetrics() {
             const startTime = performance.now();
+            const resultDiv = document.getElementById('metricsResult');
+            
+            // Show loading indicator
+            resultDiv.innerHTML = '<div style="text-align: center; padding: 40px;"><div class="spinner"></div><p>Loading metrics...</p></div>';
             
             try {
                 const filter = document.getElementById('metricsFilter').value.trim();
-                const url = filter ? '/api/v1/metrics?filter=' + encodeURIComponent(filter) : '/api/v1/metrics';
+                let url = '/api/v1/metrics';
+                const params = new URLSearchParams();
                 
-                const response = await fetch(url);
+                if (filter) {
+                    params.append('filter', filter);
+                }
+                
+                // Request with limit for faster initial load
+                params.append('limit', '1000'); // Get first 1000 for faster response
+                
+                if (params.toString()) {
+                    url += '?' + params.toString();
+                }
+                
+                const response = await fetch(url, {
+                    signal: AbortSignal.timeout(30000) // 30 second timeout
+                });
+                
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status + ': ' + response.statusText);
+                }
+                
                 const data = await response.json();
                 
                 const endTime = performance.now();
@@ -910,25 +944,37 @@ const dashboardHTML = `<!DOCTYPE html>
                 
                 if (data.status === 'success') {
                     cachedMetrics = data.data || [];
-                    displayMetrics(cachedMetrics, responseTime);
+                    const metadata = data.metadata || {};
+                    
+                    currentPage = 1;
+                    displayMetrics(cachedMetrics, responseTime, metadata);
                     
                     // Update stats
                     const now = new Date().toLocaleTimeString();
                     document.getElementById('lastUpdate').textContent = now;
                 } else {
-                    document.getElementById('metricsResult').innerHTML = 
-                        '<div class="alert alert-error">Error: ' + data.error + '</div>';
+                    resultDiv.innerHTML = 
+                        '<div class="alert alert-error">Error: ' + (data.error || 'Unknown error') + '</div>';
                 }
             } catch (error) {
                 const endTime = performance.now();
                 const responseTime = (endTime - startTime).toFixed(2);
                 
-                document.getElementById('metricsResult').innerHTML = 
-                    '<div class="alert alert-error">Error loading metrics (' + responseTime + ' ms): ' + error.message + '</div>';
+                let errorMsg = error.message;
+                if (error.name === 'AbortError' || error.name === 'TimeoutError') {
+                    errorMsg = 'Request timeout - too many metrics. Try using a filter to narrow results.';
+                }
+                
+                resultDiv.innerHTML = 
+                    '<div class="alert alert-error">Error loading metrics (' + responseTime + ' ms): ' + errorMsg + 
+                    '<br><br><strong>Suggestions:</strong><ul style="margin-top: 10px; text-align: left;">' +
+                    '<li>Use filter to search specific metrics (e.g., "node_cpu.*")</li>' +
+                    '<li>Server may be processing too many metrics</li>' +
+                    '<li>Check browser console for details</li></ul></div>';
             }
         }
 
-        function displayMetrics(metrics, responseTime) {
+        function displayMetrics(metrics, responseTime, metadata = {}) {
             const resultDiv = document.getElementById('metricsResult');
             
             if (!metrics || metrics.length === 0) {
@@ -937,15 +983,49 @@ const dashboardHTML = `<!DOCTYPE html>
                 return;
             }
 
+            const totalCount = metadata.total || metrics.length;
+            const offset = metadata.offset || 0;
+            const limit = metadata.limit || metrics.length;
+            
             let html = '<div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 15px; border-radius: 8px; margin-bottom: 15px; color: white;">';
             html += '<strong>⏱️ Response Time: ' + responseTime + ' ms</strong> | ';
-            html += '<strong>Total: ' + metrics.length + ' metrics</strong>';
+            html += '<strong>Showing: ' + metrics.length + ' metrics</strong>';
+            
+            if (totalCount > metrics.length) {
+                html += ' <strong>(Total: ' + totalCount + ')</strong>';
+                html += '<br><small>⚠️ Showing first ' + limit + ' results. Use filter to narrow search.</small>';
+            }
+            
             html += '</div>';
+            
+            // Pagination controls for client-side paging
+            const totalPages = Math.ceil(metrics.length / pageSize);
+            if (totalPages > 1) {
+                html += '<div style="margin-bottom: 15px; text-align: center;">';
+                html += 'Page: ';
+                for (let i = 1; i <= Math.min(totalPages, 10); i++) {
+                    if (i === currentPage) {
+                        html += '<strong style="margin: 0 5px; color: #667eea;">' + i + '</strong>';
+                    } else {
+                        html += '<a href="#" onclick="changePage(' + i + '); return false;" style="margin: 0 5px;">' + i + '</a>';
+                    }
+                }
+                if (totalPages > 10) {
+                    html += '... ' + totalPages;
+                }
+                html += '</div>';
+            }
+            
             html += '<div style="max-height: 500px; overflow-y: auto; background: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px;">';
             
-            metrics.forEach((metric, index) => {
+            const start = (currentPage - 1) * pageSize;
+            const end = Math.min(start + pageSize, metrics.length);
+            const pageMetrics = metrics.slice(start, end);
+            
+            pageMetrics.forEach((metric, index) => {
+                const globalIndex = start + index + 1;
                 html += '<div style="padding: 8px; border-bottom: 1px solid #eee; font-family: monospace; font-size: 0.95em;">';
-                html += (index + 1) + '. ' + metric;
+                html += globalIndex + '. ' + metric;
                 html += '</div>';
             });
             
@@ -953,11 +1033,18 @@ const dashboardHTML = `<!DOCTYPE html>
             resultDiv.innerHTML = html;
             
             // Update stats
-            document.getElementById('metricCount3').textContent = allMetrics.length || metrics.length;
+            document.getElementById('metricCount3').textContent = totalCount;
             document.getElementById('filteredMetricCount').textContent = metrics.length;
         }
 
+        function changePage(page) {
+            currentPage = page;
+            displayMetrics(cachedMetrics, '0', {});
+            window.scrollTo(0, 0);
+        }
+
         function filterMetrics() {
+            currentPage = 1; // Reset to first page
             loadAllMetrics();
         }
     </script>

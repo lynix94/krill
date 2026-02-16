@@ -74,9 +74,9 @@ func NewServer(opts ServerOptions) *Server {
 	srv := &http.Server{
 		Addr:         opts.Addr,
 		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second, // Increased for large metric lists
+		IdleTimeout:  120 * time.Second,
 	}
 
 	return &Server{

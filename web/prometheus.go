@@ -533,15 +533,40 @@ func (ph *PrometheusHandler) HandleBatchWrite(w http.ResponseWriter, r *http.Req
 }
 
 // HandleMetrics returns list of all metrics: GET /api/v1/label/__name__/values or GET /api/v1/metrics
-// Supports optional 'filter' query parameter with regex pattern
+// Supports optional query parameters:
+//   - filter: regex pattern to filter metrics
+//   - limit: maximum number of metrics to return (default: no limit)
+//   - offset: number of metrics to skip for pagination (default: 0)
 func (ph *PrometheusHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	// Get filter parameter (optional)
+	// Get query parameters
 	filterParam := r.URL.Query().Get("filter")
+	limitParam := r.URL.Query().Get("limit")
+	offsetParam := r.URL.Query().Get("offset")
+
+	// Parse limit and offset
+	var limit, offset int
+	var err error
+
+	if limitParam != "" {
+		limit, err = strconv.Atoi(limitParam)
+		if err != nil || limit < 0 {
+			ph.sendError(w, http.StatusBadRequest, "invalid limit parameter")
+			return
+		}
+	}
+
+	if offsetParam != "" {
+		offset, err = strconv.Atoi(offsetParam)
+		if err != nil || offset < 0 {
+			ph.sendError(w, http.StatusBadRequest, "invalid offset parameter")
+			return
+		}
+	}
 
 	// Get all metrics from TSDB
 	allMetrics, err := ph.tsdb.GetMetrics()
@@ -552,7 +577,7 @@ func (ph *PrometheusHandler) HandleMetrics(w http.ResponseWriter, r *http.Reques
 
 	var filteredMetrics []string
 
-	// If no filter specified, return all metrics
+	// Apply filter if specified
 	if filterParam == "" {
 		filteredMetrics = allMetrics
 	} else {
@@ -571,7 +596,35 @@ func (ph *PrometheusHandler) HandleMetrics(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	ph.sendSuccess(w, filteredMetrics)
+	totalCount := len(filteredMetrics)
+
+	// Apply pagination
+	start := offset
+	if start > totalCount {
+		start = totalCount
+	}
+
+	end := totalCount
+	if limit > 0 && start+limit < totalCount {
+		end = start + limit
+	}
+
+	paginatedMetrics := filteredMetrics[start:end]
+
+	// Send response with pagination metadata
+	response := map[string]interface{}{
+		"status": "success",
+		"data":   paginatedMetrics,
+		"metadata": map[string]interface{}{
+			"total":  totalCount,
+			"offset": offset,
+			"limit":  limit,
+			"count":  len(paginatedMetrics),
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // buildMetricKey creates a metric key with tags
