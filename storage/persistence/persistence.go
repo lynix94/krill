@@ -19,6 +19,13 @@ func NewPersistenceStorage(opts badger.BadgerOptions) (*PersistenceStorage, erro
 	return &PersistenceStorage{db: db}, nil
 }
 
+// SetMemoryCache sets the memory cache provider for zero-copy writes
+func (ps *PersistenceStorage) SetMemoryCache(cache badger.MemoryCacheProvider) {
+	if ps.db != nil {
+		ps.db.SetMemoryCache(cache)
+	}
+}
+
 // Put stores a time-series data point
 func (ps *PersistenceStorage) Put(ts int64, metric string, value float64) error {
 	return ps.db.TsdbPut(ts, metric, value)

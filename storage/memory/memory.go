@@ -1,6 +1,8 @@
 package memory
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -265,6 +267,53 @@ func (ms *MemoryStorage) GetLabels(labels storage.Labels, startTs, endTs int64) 
 	}
 
 	return timestamps, values, nil
+}
+
+// GetSerializedBlock returns a serialized block for a series bucket (for direct BadgerDB write)
+// This allows BadgerDB to write memory cache data without decompression/recompression
+// Returns nil if series doesn't exist or has no data in the bucket timerange
+func (ms *MemoryStorage) GetSerializedBlock(seriesID uint64, bucketStart int64) []byte {
+	ms.mu.RLock()
+	series, exists := ms.series[seriesID]
+	ms.mu.RUnlock()
+
+	if !exists || series.count == 0 {
+		return nil
+	}
+
+	series.mu.Lock()
+	defer series.mu.Unlock()
+
+	bucketEnd := bucketStart + 3600
+	
+	// Check if series data overlaps with bucket
+	if series.lastTimestamp < bucketStart || series.firstTimestamp >= bucketEnd {
+		return nil // Series has no data in this bucket
+	}
+
+	// Serialize the series block in BadgerDB format
+	// We need to include: SeriesID, StartTimestamp, Count, First/Last timestamps/values, compressed bytes
+	buf := new(bytes.Buffer)
+	
+	// Write header (same format as BadgerDB SeriesBlock.Serialize)
+	binary.Write(buf, binary.BigEndian, seriesID)
+	binary.Write(buf, binary.BigEndian, bucketStart)
+	binary.Write(buf, binary.BigEndian, int32(series.count))
+	binary.Write(buf, binary.BigEndian, series.firstTimestamp)
+	binary.Write(buf, binary.BigEndian, series.lastTimestamp)
+	binary.Write(buf, binary.BigEndian, series.firstValue)
+	binary.Write(buf, binary.BigEndian, series.lastValue)
+	
+	// Write compressed data
+	timestampBytes := series.timestampStream.Bytes()
+	valueBytes := series.valueStream.Bytes()
+	
+	binary.Write(buf, binary.BigEndian, int32(len(timestampBytes)))
+	buf.Write(timestampBytes)
+	binary.Write(buf, binary.BigEndian, int32(len(valueBytes)))
+	buf.Write(valueBytes)
+	
+	return buf.Bytes()
 }
 
 // GetMetrics returns all metric names (as formatted strings for backward compatibility)

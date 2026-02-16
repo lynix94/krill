@@ -102,6 +102,10 @@ func NewHybridTSDB(opts HybridOptions) (*HybridTSDB, error) {
 		asyncWrites:     asyncWrites,
 	}
 
+	// Connect memory cache to BadgerDB for zero-copy writes
+	// This eliminates disk Get + decompression + recompression cycle
+	persistStore.SetMemoryCache(memCache)
+
 	// Start background cleanup goroutine
 	go h.cleanupLoop()
 

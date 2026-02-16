@@ -33,8 +33,14 @@ type BadgerTSDB struct {
 	labelIndex   map[string]map[string][]uint64
 	labelIndexMu sync.RWMutex
 
-	debugIndex bool // Enable debug logging for index operations
-	chunkSize  int  // Batch chunk size for transactions (default: 10000)
+	debugIndex   bool                   // Enable debug logging for index operations
+	chunkSize    int                    // Batch chunk size for transactions (default: 10000)
+	memoryCache  MemoryCacheProvider    // Optional: memory cache for zero-copy writes
+}
+
+// MemoryCacheProvider interface for getting serialized blocks from memory cache
+type MemoryCacheProvider interface {
+	GetSerializedBlock(seriesID uint64, bucketStart int64) []byte
 }
 
 // BadgerOptions contains configuration for BadgerTSDB
@@ -153,6 +159,11 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 	}
 
 	return bdb, nil
+}
+
+// SetMemoryCache sets the memory cache provider for zero-copy writes
+func (bdb *BadgerTSDB) SetMemoryCache(cache MemoryCacheProvider) {
+	bdb.memoryCache = cache
 }
 
 // PutLabels stores a time-series data point with Gorilla compression using Labels
@@ -358,6 +369,26 @@ func (bdb *BadgerTSDB) writeBatchChunk(points []storage.DataPoint) error {
 			for bKey, points := range bucketPoints {
 				key := makeKeyFromID(bKey.seriesID, bKey.bucket)
 
+				// OPTIMIZATION: Try to get serialized block from memory cache first
+				// This eliminates disk Get + decompression + recompression cycle
+				var serializedBlock []byte
+				if bdb.memoryCache != nil {
+					serializedBlock = bdb.memoryCache.GetSerializedBlock(bKey.seriesID, bKey.bucket)
+				}
+
+				if serializedBlock != nil {
+					// Fast path: memory cache hit - direct write without Get!
+					entry := badger.NewEntry(key, serializedBlock)
+					if bdb.ttl > 0 {
+						entry = entry.WithTTL(bdb.ttl)
+					}
+					if err := txn.SetEntry(entry); err != nil {
+						return err
+					}
+					continue // Skip slow path
+				}
+
+				// Slow path: memory cache miss - traditional Read-Modify-Write
 				// Get existing series for this bucket
 				var existingTimestamps []int64
 				var existingValues []float64
