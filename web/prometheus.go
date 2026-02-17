@@ -658,6 +658,7 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	var badgerBlocksDecoded atomic.Int64
 	var badgerPointsScanned atomic.Int64
 	var storageSource atomic.Value
+	var downsampleNanos atomic.Int64
 	
 	// Limit concurrent goroutines to avoid overwhelming the system
 	semaphore := make(chan struct{}, 100) // Max 100 concurrent queries
@@ -705,6 +706,15 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 					return
 				}
 
+				// Apply step-based downsampling in parallel if step is specified
+				if step > 0 {
+					downsampleStart := time.Now()
+					timestamps, values = downsampleByStep(timestamps, values, start, end, step)
+					if profile != nil {
+						downsampleNanos.Add(time.Since(downsampleStart).Nanoseconds())
+					}
+				}
+
 				resultChan <- seriesResult{
 					labels: lbls,
 					timestamps: timestamps,
@@ -721,16 +731,10 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	}()
 	
 	// Collect results
-	var downsampleNanos int64
 	for sr := range resultChan {
 		timestamps, values := sr.timestamps, sr.values
 		
-		// Apply step-based downsampling if step is specified
-		if step > 0 {
-			downsampleStart := time.Now()
-			timestamps, values = downsampleByStep(timestamps, values, start, end, step)
-			downsampleNanos += time.Since(downsampleStart).Nanoseconds()
-		}
+		// Downsampling is now done in parallel within goroutines
 
 		valuesArray := make([][]interface{}, len(values))
 		for i := range values {
