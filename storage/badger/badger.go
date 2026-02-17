@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -519,6 +520,25 @@ func (bdb *BadgerTSDB) GetLabels(labels storage.Labels, startTs, endTs int64) ([
 
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
+			key := item.Key()
+
+			// Extract bucket timestamp from key (format: "seriesID:bucket")
+			// Skip blocks that are outside the query time range
+			keyStr := string(key)
+			var bucketTs int64
+			if colonIdx := strings.LastIndex(keyStr, ":"); colonIdx >= 0 {
+				if parsed, err := strconv.ParseInt(keyStr[colonIdx+1:], 10, 64); err == nil {
+					bucketTs = parsed
+					// Skip if bucket ends before query start (bucket + bucketSize < startTs)
+					if bucketTs+bdb.bucketSize < startTs {
+						continue
+					}
+					// Stop if bucket starts after query end
+					if bucketTs > endTs {
+						break
+					}
+				}
+			}
 
 			err := item.Value(func(val []byte) error {
 				// Add error recovery for corrupted data blocks
@@ -618,8 +638,28 @@ func (bdb *BadgerTSDB) GetLabelsWithProfile(labels storage.Labels, startTs, endT
 		defer it.Close()
 
 		for it.Rewind(); it.Valid(); it.Next() {
-			itemCount++
 			item := it.Item()
+			key := item.Key()
+
+			// Extract bucket timestamp from key (format: "seriesID:bucket")
+			// Skip blocks that are outside the query time range
+			keyStr := string(key)
+			var bucketTs int64
+			if colonIdx := strings.LastIndex(keyStr, ":"); colonIdx >= 0 {
+				if parsed, err := strconv.ParseInt(keyStr[colonIdx+1:], 10, 64); err == nil {
+					bucketTs = parsed
+					// Skip if bucket ends before query start (bucket + bucketSize < startTs)
+					if bucketTs+bdb.bucketSize < startTs {
+						continue
+					}
+					// Stop if bucket starts after query end
+					if bucketTs > endTs {
+						break
+					}
+				}
+			}
+
+			itemCount++
 
 			err := item.Value(func(val []byte) error {
 				// Add error recovery for corrupted data blocks

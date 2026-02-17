@@ -759,7 +759,7 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	addTiming(profile, "aggregation_ms", aggStart)
 	if profile != nil {
 		profile.TimingsMS["tsdb_get_total_ms"] = float64(tsdbGetNanos.Load()) / 1e6
-		profile.TimingsMS["downsample_ms"] = float64(downsampleNanos) / 1e6
+		profile.TimingsMS["downsample_ms"] = float64(downsampleNanos.Load()) / 1e6
 		profile.Series.Matching = int(seriesMatched.Load())
 		profile.Series.Queried = int(seriesQueried.Load())
 		profile.Series.Returned = int(seriesReturned.Load())
