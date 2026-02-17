@@ -411,7 +411,16 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 		profile.Storage.BadgerBlocksDecoded = badgerBlocksDecoded
 		profile.Storage.BadgerPointsScanned = badgerPointsScanned
 		profile.Storage.Source = storageSource
-		profile.TimingsMS["total_ms"] = float64(time.Since(startTime).Nanoseconds()) / 1e6
+		// Calculate actual response time breakdown
+		totalMs := float64(time.Since(startTime).Nanoseconds()) / 1e6
+		profile.TimingsMS["total_ms"] = totalMs
+		// series_fetch_ms shows actual time waiting for all series (vs cumulative tsdb_get_total_ms)
+		if fetchMs, ok := profile.TimingsMS["index_lookup_ms"]; ok {
+			// Estimate actual fetch time: total - parse - index - aggregation
+			parseMs := profile.TimingsMS["parse_promql_ms"]
+			aggMs := profile.TimingsMS["aggregation_ms"]
+			profile.TimingsMS["series_fetch_ms"] = totalMs - parseMs - fetchMs - aggMs
+		}
 	}
 
 	ph.sendSuccess(w, QueryData{
@@ -759,7 +768,7 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	addTiming(profile, "aggregation_ms", aggStart)
 	if profile != nil {
 		profile.TimingsMS["tsdb_get_total_ms"] = float64(tsdbGetNanos.Load()) / 1e6
-		profile.TimingsMS["downsample_ms"] = float64(downsampleNanos.Load()) / 1e6
+		profile.TimingsMS["downsample_total_ms"] = float64(downsampleNanos.Load()) / 1e6
 		profile.Series.Matching = int(seriesMatched.Load())
 		profile.Series.Queried = int(seriesQueried.Load())
 		profile.Series.Returned = int(seriesReturned.Load())

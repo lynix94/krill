@@ -340,12 +340,6 @@ const dashboardHTML = `<!DOCTYPE html>
                         </div>
                     </div>
                 </div>
-                <div class="form-group" style="margin-top: 15px;">
-                    <label style="display: flex; align-items: center; cursor: pointer;">
-                        <input type="checkbox" id="enableProfiling" style="width: auto; margin-right: 8px;">
-                        <span>Enable Query Profiling (shows timing and I/O stats)</span>
-                    </label>
-                </div>
                 <button class="btn-execute" onclick="executeQuery()">Execute Query</button>
                 
                 <div id="queryResult" class="result-box" style="display: none;">
@@ -643,7 +637,6 @@ const dashboardHTML = `<!DOCTYPE html>
             const resultDiv = document.getElementById('queryResult');
             const outputPre = document.getElementById('queryOutput');
             const chartContainer = document.getElementById('chartContainer');
-            const enableProfiling = document.getElementById('enableProfiling').checked;
             
             // Start timing
             const startTime = performance.now();
@@ -652,19 +645,51 @@ const dashboardHTML = `<!DOCTYPE html>
                 let response, data;
                 
                 if (queryType === 'instant') {
-                    const profileParam = enableProfiling ? '&profile=1' : '';
-                    response = await fetch('/api/v1/query?query=' + encodeURIComponent(metric) + profileParam);
+                    response = await fetch('/api/v1/query?query=' + encodeURIComponent(metric) + '&profile=1');
+                    const responseReceivedTime = performance.now();
                     data = await response.json();
                     
                     const endTime = performance.now();
                     const responseTime = (endTime - startTime).toFixed(2);
+                    const serverProcessing = data.data?.profile?.timings_ms?.total_ms?.toFixed(2) || '0';
+                    const serverResponse = (responseReceivedTime - startTime).toFixed(2);
+                    const uiTime = (endTime - responseReceivedTime).toFixed(2);
                     
                     resultDiv.style.display = 'block';
                     chartContainer.style.display = 'none';
                     
-                    const header = document.createElement('strong');
-                    header.style.color = '#667eea';
-                    header.textContent = '⏱️ Response Time: ' + responseTime + ' ms';
+                    const header = document.createElement('div');
+                    header.style.marginBottom = '10px';
+                    
+                    const serverProcSpan = document.createElement('strong');
+                    serverProcSpan.style.color = '#667eea';
+                    serverProcSpan.textContent = '🖥️ Server Processing: ' + serverProcessing + ' ms';
+                    
+                    const sep1 = document.createTextNode(' | ');
+                    
+                    const serverRespSpan = document.createElement('strong');
+                    serverRespSpan.style.color = '#764ba2';
+                    serverRespSpan.textContent = '📡 Server Response: ' + serverResponse + ' ms';
+                    
+                    const sep2 = document.createTextNode(' | ');
+                    
+                    const uiSpan = document.createElement('strong');
+                    uiSpan.style.color = '#f093fb';
+                    uiSpan.textContent = '🖼️ UI: ' + uiTime + ' ms';
+                    
+                    const sep3 = document.createTextNode(' | ');
+                    
+                    const responseSpan = document.createElement('strong');
+                    responseSpan.style.color = '#4facfe';
+                    responseSpan.textContent = '⏱️ Total: ' + responseTime + ' ms';
+                    
+                    header.appendChild(serverProcSpan);
+                    header.appendChild(sep1);
+                    header.appendChild(serverRespSpan);
+                    header.appendChild(sep2);
+                    header.appendChild(uiSpan);
+                    header.appendChild(sep3);
+                    header.appendChild(responseSpan);
                     
                     outputPre.textContent = '\n\n' + JSON.stringify(data, null, 2);
                     outputPre.prepend(header);
@@ -691,33 +716,65 @@ const dashboardHTML = `<!DOCTYPE html>
                         step = 60; // 1 minute for ranges > 1 hour
                     }
                     
-                    const profileParam = enableProfiling ? '&profile=1' : '';
                     response = await fetch(
                         '/api/v1/query_range?query=' + encodeURIComponent(metric) + 
-                        '&start=' + start + '&end=' + end + '&step=' + step + profileParam
+                        '&start=' + start + '&end=' + end + '&step=' + step + '&profile=1'
                     );
+                    const responseReceivedTime = performance.now();
                     data = await response.json();
                     
                     const endTime = performance.now();
                     const responseTime = (endTime - startTime).toFixed(2);
+                    const serverProcessing = data.data?.profile?.timings_ms?.total_ms?.toFixed(2) || '0';
+                    const serverResponse = (responseReceivedTime - startTime).toFixed(2);
+                    const uiTime = (endTime - responseReceivedTime).toFixed(2);
                     const dataPoints = data.data?.result?.[0]?.values?.length || 0;
                     
                     resultDiv.style.display = 'block';
                     
-                    const header1 = document.createElement('strong');
-                    header1.style.color = '#667eea';
-                    header1.textContent = '⏱️ Response Time: ' + responseTime + ' ms';
+                    const header = document.createElement('div');
+                    header.style.marginBottom = '10px';
                     
-                    const separator = document.createTextNode(' | ');
+                    const serverProcSpan = document.createElement('strong');
+                    serverProcSpan.style.color = '#667eea';
+                    serverProcSpan.textContent = '🖥️ Server Processing: ' + serverProcessing + ' ms';
                     
-                    const header2 = document.createElement('strong');
-                    header2.style.color = '#764ba2';
-                    header2.textContent = '📊 Data Points: ' + dataPoints;
+                    const sep1 = document.createTextNode(' | ');
+                    
+                    const serverRespSpan = document.createElement('strong');
+                    serverRespSpan.style.color = '#764ba2';
+                    serverRespSpan.textContent = '📡 Server Response: ' + serverResponse + ' ms';
+                    
+                    const sep2 = document.createTextNode(' | ');
+                    
+                    const uiSpan = document.createElement('strong');
+                    uiSpan.style.color = '#f093fb';
+                    uiSpan.textContent = '🖼️ UI: ' + uiTime + ' ms';
+                    
+                    const sep3 = document.createTextNode(' | ');
+                    
+                    const responseSpan = document.createElement('strong');
+                    responseSpan.style.color = '#4facfe';
+                    responseSpan.textContent = '⏱️ Total: ' + responseTime + ' ms';
+                    
+                    const sep4 = document.createTextNode(' | ');
+                    
+                    const dataSpan = document.createElement('strong');
+                    dataSpan.style.color = '#00f2fe';
+                    dataSpan.textContent = '📊 Points: ' + dataPoints;
+                    
+                    header.appendChild(serverProcSpan);
+                    header.appendChild(sep1);
+                    header.appendChild(serverRespSpan);
+                    header.appendChild(sep2);
+                    header.appendChild(uiSpan);
+                    header.appendChild(sep3);
+                    header.appendChild(responseSpan);
+                    header.appendChild(sep4);
+                    header.appendChild(dataSpan);
                     
                     outputPre.textContent = '\n\n' + JSON.stringify(data, null, 2);
-                    outputPre.prepend(header2);
-                    outputPre.prepend(separator);
-                    outputPre.prepend(header1);
+                    outputPre.prepend(header);
                     
                     // Draw chart
                     if (data.status === 'success' && data.data.result && data.data.result.length > 0) {
@@ -739,7 +796,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 
                 const header = document.createElement('strong');
                 header.style.color = '#f5576c';
-                header.textContent = '⏱️ Response Time: ' + responseTime + ' ms (Error)';
+                header.textContent = '⏱️ Response: ' + responseTime + ' ms (Error)';
                 
                 outputPre.textContent = '\n\nError: ' + error.message;
                 outputPre.prepend(header);
