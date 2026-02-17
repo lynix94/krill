@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 	"sync"
+	"sync/atomic"
 
 	"github.com/lynix/krill"
 	"github.com/lynix/krill/storage"
@@ -24,6 +25,57 @@ type PrometheusHandler struct {
 	stats      *Stats
 }
 
+func isProfileEnabled(r *http.Request) bool {
+	profileParam := r.URL.Query().Get("profile")
+	if r.Method == http.MethodPost && profileParam == "" {
+		profileParam = r.FormValue("profile")
+	}
+	if profileParam == "" {
+		return false
+	}
+	switch strings.ToLower(profileParam) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func toInt64(value interface{}) int64 {
+	switch v := value.(type) {
+	case int:
+		return int64(v)
+	case int32:
+		return int64(v)
+	case int64:
+		return v
+	case uint:
+		return int64(v)
+	case uint32:
+		return int64(v)
+	case uint64:
+		if v > math.MaxInt64 {
+			return math.MaxInt64
+		}
+		return int64(v)
+	case float32:
+		return int64(v)
+	case float64:
+		return int64(v)
+	default:
+		return 0
+	}
+}
+
+func addTiming(profile *QueryProfile, key string, start time.Time) {
+	if profile == nil {
+		return
+	}
+	if profile.TimingsMS == nil {
+		profile.TimingsMS = make(map[string]float64)
+	}
+	profile.TimingsMS[key] = float64(time.Since(start).Nanoseconds()) / 1e6
+}
 // NewPrometheusHandler creates a new Prometheus API handler
 func NewPrometheusHandler(tsdb krill.QueryableDB) *PrometheusHandler {
 	return &PrometheusHandler{
@@ -49,6 +101,42 @@ type QueryResult struct {
 type QueryData struct {
 	ResultType string        `json:"resultType" msgpack:"resultType"`
 	Result     []QueryResult `json:"result" msgpack:"result"`
+	Profile    *QueryProfile `json:"profile,omitempty" msgpack:"profile,omitempty"`
+}
+
+// QueryProfile represents optional profiling details for a query
+type QueryProfile struct {
+	TimingsMS map[string]float64 `json:"timings_ms,omitempty"`
+	Index     *IndexProfile      `json:"index,omitempty"`
+	Storage   *StorageProfile    `json:"storage,omitempty"`
+	Series    *SeriesProfile     `json:"series,omitempty"`
+}
+
+// IndexProfile summarizes index lookup details
+type IndexProfile struct {
+	Used            bool              `json:"used"`
+	MatcherCount    int               `json:"matcher_count,omitempty"`
+	SeriesIDsCount  int               `json:"series_ids_count,omitempty"`
+	LabelsResolved  int               `json:"labels_resolved,omitempty"`
+	FallbackReason  string            `json:"fallback_reason,omitempty"`
+	SampleSeriesIDs []uint64          `json:"sample_series_ids,omitempty"`
+	Matchers        map[string]string `json:"matchers,omitempty"`
+}
+
+// StorageProfile summarizes storage access details
+type StorageProfile struct {
+	Source              string `json:"source,omitempty"`
+	DiskIOCount         int64  `json:"disk_io_count,omitempty"`
+	BadgerItems         int64  `json:"badger_items,omitempty"`
+	BadgerBlocksDecoded int64  `json:"badger_blocks_decoded,omitempty"`
+	BadgerPointsScanned int64  `json:"badger_points_scanned,omitempty"`
+}
+
+// SeriesProfile summarizes series-level counts
+type SeriesProfile struct {
+	Matching int `json:"matching,omitempty"`
+	Queried  int `json:"queried,omitempty"`
+	Returned int `json:"returned,omitempty"`
 }
 
 // FunctionStage represents a function to apply in a pipeline
@@ -90,6 +178,17 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 		}
 	}()
 
+	profileEnabled := isProfileEnabled(r)
+	var profile *QueryProfile
+	if profileEnabled {
+		profile = &QueryProfile{
+			TimingsMS: make(map[string]float64),
+			Index:     &IndexProfile{},
+			Storage:   &StorageProfile{},
+			Series:    &SeriesProfile{},
+		}
+	}
+
 	// Support both GET and POST methods (Grafana uses both)
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -124,7 +223,9 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Parse query with aggregation support
+	parseStart := time.Now()
 	parsed := parsePromQL(query)
+	addTiming(profile, "parse_promql_ms", parseStart)
 	log.Printf("[PARSE] Query: %s => MetricName: %q, LabelMatchers: %v, AggFunc: %v",
 		query, parsed.MetricName, parsed.LabelMatchers, parsed.AggFunc)
 
@@ -147,10 +248,15 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 	type LabelsGetter interface {
 		GetLabelsForSeriesID(uint64) (storage.Labels, bool)
 	}
+	type ProfiledGetter interface {
+		GetWithProfile(metric string, startTs, endTs int64) ([]int64, []float64, map[string]interface{}, error)
+	}
 
 	var result []QueryResult
 	var matchingSeries []storage.Labels
 
+	indexStart := time.Now()
+	indexFallbackReason := ""
 	if finder, ok := ph.tsdb.(IndexFinder); ok && parsed.MetricName != "" {
 		// Use inverted index to find matching series
 		// Even with just metric name, index helps narrow down from 500k to thousands
@@ -163,6 +269,19 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 		log.Printf("[INDEX] Using index search with matchers: %v", allMatchers)
 		seriesIDs := finder.FindSeriesByLabels(allMatchers)
 		log.Printf("[INDEX] Found %d matching series IDs", len(seriesIDs))
+		if profile != nil {
+			profile.Index.Used = true
+			profile.Index.MatcherCount = len(allMatchers)
+			profile.Index.SeriesIDsCount = len(seriesIDs)
+			profile.Index.Matchers = allMatchers
+			if len(seriesIDs) > 0 {
+				limit := len(seriesIDs)
+				if limit > 10 {
+					limit = 10
+				}
+				profile.Index.SampleSeriesIDs = append([]uint64{}, seriesIDs[:limit]...)
+			}
+		}
 
 		// Convert seriesIDs to Labels
 		if labelsGetter, ok := ph.tsdb.(LabelsGetter); ok {
@@ -171,8 +290,12 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 					matchingSeries = append(matchingSeries, labels)
 				}
 			}
+			if profile != nil {
+				profile.Index.LabelsResolved = len(matchingSeries)
+			}
 		} else {
 			log.Printf("[INDEX] LabelsGetter not available, fallback to full scan")
+			indexFallbackReason = "labels_getter_unavailable"
 			allSeries, err := ph.tsdb.GetAllSeries()
 			if err != nil {
 				ph.sendError(w, http.StatusInternalServerError, err.Error())
@@ -183,6 +306,13 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 		}
 	} else {
 		log.Printf("[FULLSCAN] Index not available or no metric name, using full scan")
+		if _, ok := ph.tsdb.(IndexFinder); !ok {
+			indexFallbackReason = "index_not_available"
+		} else if parsed.MetricName == "" {
+			indexFallbackReason = "metric_name_empty"
+		} else {
+			indexFallbackReason = "index_fallback"
+		}
 		allSeries, err := ph.tsdb.GetAllSeries()
 		if err != nil {
 			ph.sendError(w, http.StatusInternalServerError, err.Error())
@@ -191,20 +321,54 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 		log.Printf("[FULLSCAN] Scanning %d total series", len(allSeries))
 		matchingSeries = allSeries
 	}
+	addTiming(profile, "index_lookup_ms", indexStart)
+	if profile != nil && indexFallbackReason != "" {
+		profile.Index.FallbackReason = indexFallbackReason
+	}
 
 	// Filter series by name and labels
+	var seriesMatched, seriesQueried, seriesReturned int
+	var tsdbGetNanos int64
+	var diskIOCount, badgerItems, badgerBlocksDecoded, badgerPointsScanned int64
+	storageSource := ""
 	for _, labels := range matchingSeries {
 		if matchesLabels(labels, parsed.MetricName, parsed.LabelMatchers) {
+			seriesMatched++
 			// Format labels to metric key for DB lookup
 			metric := formatLabelsAsMetricString(labels)
 
 			// Query TSDB for this specific metric
-			timestamps, values, err := ph.tsdb.Get(metric, startTs, endTs)
+			seriesQueried++
+			getStart := time.Now()
+			var timestamps []int64
+			var values []float64
+			var err error
+			if getter, ok := ph.tsdb.(ProfiledGetter); ok && profile != nil {
+				var storageProfile map[string]interface{}
+				timestamps, values, storageProfile, err = getter.GetWithProfile(metric, startTs, endTs)
+				if storageProfile != nil {
+					diskIOCount += toInt64(storageProfile["disk_io_count"])
+					badgerItems += toInt64(storageProfile["badger_items"])
+					badgerBlocksDecoded += toInt64(storageProfile["badger_blocks_decoded"])
+					badgerPointsScanned += toInt64(storageProfile["badger_points_scanned"])
+					if src, ok := storageProfile["source"].(string); ok {
+						if storageSource == "" {
+							storageSource = src
+						} else if storageSource != src {
+							storageSource = "mixed"
+						}
+					}
+				}
+			} else {
+				timestamps, values, err = ph.tsdb.Get(metric, startTs, endTs)
+			}
+			tsdbGetNanos += time.Since(getStart).Nanoseconds()
 			if err != nil {
 				continue
 			}
 
 			if len(values) > 0 {
+				seriesReturned++
 				// Build tags map from labels (already parsed!)
 				parsedTags := make(map[string]string)
 				for _, label := range labels {
@@ -234,11 +398,26 @@ func (ph *PrometheusHandler) HandleQuery(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Apply aggregation if specified
+	aggStart := time.Now()
 	result = applyAggregation(parsed, result)
+	addTiming(profile, "aggregation_ms", aggStart)
+	if profile != nil {
+		profile.TimingsMS["tsdb_get_total_ms"] = float64(tsdbGetNanos) / 1e6
+		profile.Series.Matching = seriesMatched
+		profile.Series.Queried = seriesQueried
+		profile.Series.Returned = seriesReturned
+		profile.Storage.DiskIOCount = diskIOCount
+		profile.Storage.BadgerItems = badgerItems
+		profile.Storage.BadgerBlocksDecoded = badgerBlocksDecoded
+		profile.Storage.BadgerPointsScanned = badgerPointsScanned
+		profile.Storage.Source = storageSource
+		profile.TimingsMS["total_ms"] = float64(time.Since(startTime).Nanoseconds()) / 1e6
+	}
 
 	ph.sendSuccess(w, QueryData{
 		ResultType: "vector",
 		Result:     result,
+		Profile:    profile,
 	})
 }
 
@@ -250,6 +429,17 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 			ph.stats.RecordRangeQuery(time.Since(startTime))
 		}
 	}()
+
+	profileEnabled := isProfileEnabled(r)
+	var profile *QueryProfile
+	if profileEnabled {
+		profile = &QueryProfile{
+			TimingsMS: make(map[string]float64),
+			Index:     &IndexProfile{},
+			Storage:   &StorageProfile{},
+			Series:    &SeriesProfile{},
+		}
+	}
 
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -317,7 +507,9 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	}
 
 	// Parse query with aggregation support
+	parseStart := time.Now()
 	parsed := parsePromQL(query)
+	addTiming(profile, "parse_promql_ms", parseStart)
 	log.Printf("[PARSE] Query: %s => MetricName: %q, LabelMatchers: %v, AggFunc: %v",
 		query, parsed.MetricName, parsed.LabelMatchers, parsed.AggFunc)
 
@@ -336,10 +528,16 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 					parsed.AggFunc, parsed.AggFunc))
 			return
 		}
+		stepEvalStart := time.Now()
 		result := ph.evaluateRangeVectorWithStep(parsed, start, end, step)
+		addTiming(profile, "range_vector_step_eval_ms", stepEvalStart)
+		if profile != nil {
+			profile.TimingsMS["total_ms"] = float64(time.Since(startTime).Nanoseconds()) / 1e6
+		}
 		ph.sendSuccess(w, QueryData{
 			ResultType: "matrix",
 			Result:     result,
+			Profile:    profile,
 		})
 		return
 	}
@@ -351,10 +549,15 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	type LabelsGetter interface {
 		GetLabelsForSeriesID(uint64) (storage.Labels, bool)
 	}
+	type ProfiledGetter interface {
+		GetWithProfile(metric string, startTs, endTs int64) ([]int64, []float64, map[string]interface{}, error)
+	}
 
 	var result []QueryResult
 	var matchingSeries []storage.Labels
 
+	indexStart := time.Now()
+	indexFallbackReason := ""
 	if finder, ok := ph.tsdb.(IndexFinder); ok && parsed.MetricName != "" {
 		// Use inverted index to find matching series
 		// Even with just metric name, index helps narrow down from 500k to thousands
@@ -371,6 +574,19 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 		if ph.debugIndex {
 			log.Printf("[INDEX-RANGE] Found %d matching series IDs", len(seriesIDs))
 		}
+		if profile != nil {
+			profile.Index.Used = true
+			profile.Index.MatcherCount = len(allMatchers)
+			profile.Index.SeriesIDsCount = len(seriesIDs)
+			profile.Index.Matchers = allMatchers
+			if len(seriesIDs) > 0 {
+				limit := len(seriesIDs)
+				if limit > 10 {
+					limit = 10
+				}
+				profile.Index.SampleSeriesIDs = append([]uint64{}, seriesIDs[:limit]...)
+			}
+		}
 
 		// Convert seriesIDs to Labels
 		if labelsGetter, ok := ph.tsdb.(LabelsGetter); ok {
@@ -379,11 +595,15 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 					matchingSeries = append(matchingSeries, labels)
 				}
 			}
+			if profile != nil {
+				profile.Index.LabelsResolved = len(matchingSeries)
+			}
 		} else {
 			// Fallback: get all series
 			if ph.debugIndex {
 				log.Printf("[INDEX-RANGE] LabelsGetter not available, fallback to full scan")
 			}
+			indexFallbackReason = "labels_getter_unavailable"
 			allSeries, err := ph.tsdb.GetAllSeries()
 			if err != nil {
 				ph.sendError(w, http.StatusInternalServerError, err.Error())
@@ -398,10 +618,13 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 		// Fallback: get all series and filter
 		if _, ok := ph.tsdb.(IndexFinder); !ok {
 			log.Printf("[FULLSCAN-RANGE] IndexFinder interface not implemented by %T", ph.tsdb)
+			indexFallbackReason = "index_not_available"
 		} else if parsed.MetricName == "" {
 			log.Printf("[FULLSCAN-RANGE] MetricName is empty")
+			indexFallbackReason = "metric_name_empty"
 		} else {
 			log.Printf("[FULLSCAN-RANGE] Unknown reason for fallback")
+			indexFallbackReason = "index_fallback"
 		}
 		log.Printf("[FULLSCAN-RANGE] Index not available or no metric name, using full scan")
 		allSeries, err := ph.tsdb.GetAllSeries()
@@ -411,6 +634,10 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 		}
 		log.Printf("[FULLSCAN-RANGE] Scanning %d total series", len(allSeries))
 		matchingSeries = allSeries
+	}
+	addTiming(profile, "index_lookup_ms", indexStart)
+	if profile != nil && indexFallbackReason != "" {
+		profile.Index.FallbackReason = indexFallbackReason
 	}
 
 	// Filter series by name and labels - PARALLEL PROCESSING
@@ -422,12 +649,23 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	
 	resultChan := make(chan seriesResult, len(matchingSeries))
 	var wg sync.WaitGroup
+	var seriesMatched atomic.Int64
+	var seriesQueried atomic.Int64
+	var seriesReturned atomic.Int64
+	var tsdbGetNanos atomic.Int64
+	var diskIOCount atomic.Int64
+	var badgerItems atomic.Int64
+	var badgerBlocksDecoded atomic.Int64
+	var badgerPointsScanned atomic.Int64
+	var storageSource atomic.Value
 	
 	// Limit concurrent goroutines to avoid overwhelming the system
 	semaphore := make(chan struct{}, 100) // Max 100 concurrent queries
 	
+	seriesQueryStart := time.Now()
 	for _, labels := range matchingSeries {
 		if matchesLabels(labels, parsed.MetricName, parsed.LabelMatchers) {
+			seriesMatched.Add(1)
 			wg.Add(1)
 			go func(lbls storage.Labels) {
 				defer wg.Done()
@@ -438,7 +676,31 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 				metric := formatLabelsAsMetricString(lbls)
 
 				// Query TSDB for this specific metric
-				timestamps, values, err := ph.tsdb.Get(metric, start, end)
+				seriesQueried.Add(1)
+				getStart := time.Now()
+				var timestamps []int64
+				var values []float64
+				var err error
+				if getter, ok := ph.tsdb.(ProfiledGetter); ok && profile != nil {
+					var storageProfile map[string]interface{}
+					timestamps, values, storageProfile, err = getter.GetWithProfile(metric, start, end)
+					if storageProfile != nil {
+						diskIOCount.Add(toInt64(storageProfile["disk_io_count"]))
+						badgerItems.Add(toInt64(storageProfile["badger_items"]))
+						badgerBlocksDecoded.Add(toInt64(storageProfile["badger_blocks_decoded"]))
+						badgerPointsScanned.Add(toInt64(storageProfile["badger_points_scanned"]))
+						if src, ok := storageProfile["source"].(string); ok {
+							if existing, ok := storageSource.Load().(string); !ok || existing == "" {
+								storageSource.Store(src)
+							} else if existing != src {
+								storageSource.Store("mixed")
+							}
+						}
+					}
+				} else {
+					timestamps, values, err = ph.tsdb.Get(metric, start, end)
+				}
+				tsdbGetNanos.Add(time.Since(getStart).Nanoseconds())
 				if err != nil || len(values) == 0 {
 					return
 				}
@@ -459,12 +721,15 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	}()
 	
 	// Collect results
+	var downsampleNanos int64
 	for sr := range resultChan {
 		timestamps, values := sr.timestamps, sr.values
 		
 		// Apply step-based downsampling if step is specified
 		if step > 0 {
+			downsampleStart := time.Now()
 			timestamps, values = downsampleByStep(timestamps, values, start, end, step)
+			downsampleNanos += time.Since(downsampleStart).Nanoseconds()
 		}
 
 		valuesArray := make([][]interface{}, len(values))
@@ -480,14 +745,34 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 			Metric: parsedTags,
 			Values: valuesArray,
 		})
+		seriesReturned.Add(1)
 	}
+	addTiming(profile, "series_query_ms", seriesQueryStart)
 
 	// Apply aggregation if specified
+	aggStart := time.Now()
 	result = applyAggregation(parsed, result)
+	addTiming(profile, "aggregation_ms", aggStart)
+	if profile != nil {
+		profile.TimingsMS["tsdb_get_total_ms"] = float64(tsdbGetNanos.Load()) / 1e6
+		profile.TimingsMS["downsample_ms"] = float64(downsampleNanos) / 1e6
+		profile.Series.Matching = int(seriesMatched.Load())
+		profile.Series.Queried = int(seriesQueried.Load())
+		profile.Series.Returned = int(seriesReturned.Load())
+		profile.Storage.DiskIOCount = diskIOCount.Load()
+		profile.Storage.BadgerItems = badgerItems.Load()
+		profile.Storage.BadgerBlocksDecoded = badgerBlocksDecoded.Load()
+		profile.Storage.BadgerPointsScanned = badgerPointsScanned.Load()
+		if src, ok := storageSource.Load().(string); ok {
+			profile.Storage.Source = src
+		}
+		profile.TimingsMS["total_ms"] = float64(time.Since(startTime).Nanoseconds()) / 1e6
+	}
 
 	ph.sendSuccess(w, QueryData{
 		ResultType: "matrix",
 		Result:     result,
+		Profile:    profile,
 	})
 }
 

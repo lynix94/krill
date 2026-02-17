@@ -591,10 +591,131 @@ func (bdb *BadgerTSDB) GetLabels(labels storage.Labels, startTs, endTs int64) ([
 	return timestamps, values, nil
 }
 
+// GetLabelsWithProfile retrieves data points with profiling information
+func (bdb *BadgerTSDB) GetLabelsWithProfile(labels storage.Labels, startTs, endTs int64) ([]int64, []float64, map[string]interface{}, error) {
+	if endTs == 0 {
+		endTs = math.MaxInt64
+	}
+
+	seriesID := labels.Hash()
+
+	type dataPoint struct {
+		timestamp int64
+		value     float64
+	}
+	var allPoints []dataPoint
+	var itemCount int64
+	var decodeBlocks int64
+	var pointsScanned int64
+
+	err := bdb.db.View(func(txn *badger.Txn) error {
+		// Iterate through all buckets that might contain data
+		prefix := makeKeyPrefixFromID(seriesID)
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			itemCount++
+			item := it.Item()
+
+			err := item.Value(func(val []byte) error {
+				// Add error recovery for corrupted data blocks
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[BADGER] Warning: Recovered from panic while deserializing data block: %v", r)
+					}
+				}()
+
+				series, err := DeserializeSeriesBlock(val)
+				if err != nil {
+					// Log and skip corrupted block instead of failing entire query
+					log.Printf("[BADGER] Warning: Skipping corrupted data block: %v", err)
+					return nil
+				}
+
+				timestamps, values, err := series.Decode()
+				if err != nil {
+					log.Printf("[BADGER] Warning: Skipping block with decode error: %v", err)
+					return nil
+				}
+				decodeBlocks++
+				pointsScanned += int64(len(timestamps))
+
+				// Filter by time range and collect points
+				for i, ts := range timestamps {
+					if ts >= startTs && ts <= endTs {
+						allPoints = append(allPoints, dataPoint{
+							timestamp: ts,
+							value:     values[i],
+						})
+					}
+				}
+
+				return nil
+			})
+
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	if len(allPoints) == 0 {
+		return nil, nil, map[string]interface{}{
+			"source":                "badger",
+			"disk_io_count":         itemCount,
+			"badger_items":          itemCount,
+			"badger_blocks_decoded": decodeBlocks,
+			"badger_points_scanned": pointsScanned,
+		}, fmt.Errorf("metric not found: %s", labels.String())
+	}
+
+	// Sort by timestamp (BadgerDB iterator may not return keys in order)
+	// Simple insertion sort since data is likely already mostly sorted
+	for i := 1; i < len(allPoints); i++ {
+		j := i
+		for j > 0 && allPoints[j-1].timestamp > allPoints[j].timestamp {
+			allPoints[j-1], allPoints[j] = allPoints[j], allPoints[j-1]
+			j--
+		}
+	}
+
+	// Extract sorted timestamps and values
+	timestamps := make([]int64, len(allPoints))
+	values := make([]float64, len(allPoints))
+	for i, point := range allPoints {
+		timestamps[i] = point.timestamp
+		values[i] = point.value
+	}
+
+	return timestamps, values, map[string]interface{}{
+		"source":                "badger",
+		"disk_io_count":         itemCount,
+		"badger_items":          itemCount,
+		"badger_blocks_decoded": decodeBlocks,
+		"badger_points_scanned": pointsScanned,
+	}, nil
+}
+
 // Get retrieves all data points for a metric within a time range (legacy string-based API)
 func (bdb *BadgerTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float64, error) {
 	labels := parseMetricString(metric)
 	return bdb.GetLabels(labels, startTs, endTs)
+}
+
+// GetWithProfile retrieves data points for a metric and returns profiling details
+func (bdb *BadgerTSDB) GetWithProfile(metric string, startTs, endTs int64) ([]int64, []float64, map[string]interface{}, error) {
+	labels := parseMetricString(metric)
+	return bdb.GetLabelsWithProfile(labels, startTs, endTs)
 }
 
 // GetAllSeries returns all series (labels) in the database

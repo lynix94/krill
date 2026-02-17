@@ -271,6 +271,150 @@ func (h *HybridTSDB) Get(metric string, startTs, endTs int64) ([]int64, []float6
 	return allTimestamps, allValues, nil
 }
 
+// GetWithProfile retrieves data points with profiling information
+func (h *HybridTSDB) GetWithProfile(metric string, startTs, endTs int64) ([]int64, []float64, map[string]interface{}, error) {
+	if endTs == 0 {
+		endTs = 1<<63 - 1 // Max int64
+	}
+
+	var allTimestamps []int64
+	var allValues []float64
+	profile := make(map[string]interface{})
+	profile["source"] = "hybrid"
+	var diskIOCount, badgerItems, badgerBlocksDecoded, badgerPointsScanned int64
+
+	// Calculate effective cache cutoff
+	now := time.Now().Unix()
+	cacheCutoff := now - int64(h.cacheDuration.Seconds())
+	if h.serverStartTime > cacheCutoff {
+		cacheCutoff = h.serverStartTime
+	}
+
+	// If query is entirely before server start, use persistent storage only
+	if endTs < h.serverStartTime {
+		type ProfiledGetter interface {
+			GetWithProfile(metric string, startTs, endTs int64) ([]int64, []float64, map[string]interface{}, error)
+		}
+		if getter, ok := h.persistStorage.(ProfiledGetter); ok {
+			ts, vals, prof, err := getter.GetWithProfile(metric, startTs, endTs)
+			if prof != nil {
+				profile["disk_io_count"] = prof["disk_io_count"]
+				profile["badger_items"] = prof["badger_items"]
+				profile["badger_blocks_decoded"] = prof["badger_blocks_decoded"]
+				profile["badger_points_scanned"] = prof["badger_points_scanned"]
+			}
+			return ts, vals, profile, err
+		}
+		ts, vals, err := h.persistStorage.Get(metric, startTs, endTs)
+		return ts, vals, profile, err
+	}
+
+	// Query overlaps with cache range - check both storages
+	type ProfiledGetter interface {
+		GetWithProfile(metric string, startTs, endTs int64) ([]int64, []float64, map[string]interface{}, error)
+	}
+
+	// Get old data from persistent storage (before cache cutoff)
+	if startTs < cacheCutoff {
+		if getter, ok := h.persistStorage.(ProfiledGetter); ok {
+			persistTimestamps, persistValues, prof, err := getter.GetWithProfile(metric, startTs, cacheCutoff-1)
+			if err == nil && len(persistTimestamps) > 0 {
+				allTimestamps = append(allTimestamps, persistTimestamps...)
+				allValues = append(allValues, persistValues...)
+			}
+			if prof != nil {
+				diskIOCount += toInt64Helper(prof["disk_io_count"])
+				badgerItems += toInt64Helper(prof["badger_items"])
+				badgerBlocksDecoded += toInt64Helper(prof["badger_blocks_decoded"])
+				badgerPointsScanned += toInt64Helper(prof["badger_points_scanned"])
+			}
+		} else {
+			persistTimestamps, persistValues, err := h.persistStorage.Get(metric, startTs, cacheCutoff-1)
+			if err == nil && len(persistTimestamps) > 0 {
+				allTimestamps = append(allTimestamps, persistTimestamps...)
+				allValues = append(allValues, persistValues...)
+			}
+		}
+	}
+
+	// Get recent data from both persistent storage and memory cache
+	cacheStart := cacheCutoff
+	if startTs > cacheStart {
+		cacheStart = startTs
+	}
+
+	// Get from persistent storage
+	if getter, ok := h.persistStorage.(ProfiledGetter); ok {
+		persistRecentTs, persistRecentVals, prof, err := getter.GetWithProfile(metric, cacheStart, endTs)
+		if err == nil && len(persistRecentTs) > 0 {
+			allTimestamps = append(allTimestamps, persistRecentTs...)
+			allValues = append(allValues, persistRecentVals...)
+		}
+		if prof != nil {
+			diskIOCount += toInt64Helper(prof["disk_io_count"])
+			badgerItems += toInt64Helper(prof["badger_items"])
+			badgerBlocksDecoded += toInt64Helper(prof["badger_blocks_decoded"])
+			badgerPointsScanned += toInt64Helper(prof["badger_points_scanned"])
+		}
+	} else {
+		persistRecentTs, persistRecentVals, err := h.persistStorage.Get(metric, cacheStart, endTs)
+		if err == nil && len(persistRecentTs) > 0 {
+			allTimestamps = append(allTimestamps, persistRecentTs...)
+			allValues = append(allValues, persistRecentVals...)
+		}
+	}
+
+	// Get from memory cache (no profiling for memory)
+	cacheTimestamps, cacheValues, err := h.memoryCache.Get(metric, cacheStart, endTs)
+	if err == nil && len(cacheTimestamps) > 0 {
+		allTimestamps = append(allTimestamps, cacheTimestamps...)
+		allValues = append(allValues, cacheValues...)
+	}
+
+	if len(allTimestamps) == 0 {
+		profile["disk_io_count"] = diskIOCount
+		profile["badger_items"] = badgerItems
+		profile["badger_blocks_decoded"] = badgerBlocksDecoded
+		profile["badger_points_scanned"] = badgerPointsScanned
+		return nil, nil, profile, fmt.Errorf("metric not found: %s", metric)
+	}
+
+	// Deduplicate and sort by timestamp
+	allTimestamps, allValues = deduplicateTimeseries(allTimestamps, allValues)
+
+	profile["disk_io_count"] = diskIOCount
+	profile["badger_items"] = badgerItems
+	profile["badger_blocks_decoded"] = badgerBlocksDecoded
+	profile["badger_points_scanned"] = badgerPointsScanned
+	return allTimestamps, allValues, profile, nil
+}
+
+func toInt64Helper(v interface{}) int64 {
+	switch val := v.(type) {
+	case int:
+		return int64(val)
+	case int32:
+		return int64(val)
+	case int64:
+		return val
+	case uint:
+		return int64(val)
+	case uint32:
+		return int64(val)
+	case uint64:
+		if val > 1<<63-1 {
+			return 1<<63 - 1
+		}
+		return int64(val)
+	case float32:
+		return int64(val)
+	case float64:
+		return int64(val)
+	default:
+		return 0
+	}
+}
+
 // GetLabels retrieves data points by labels, trying memory cache first for recent data
 func (h *HybridTSDB) GetLabels(labels storage.Labels, startTs, endTs int64) ([]int64, []float64, error) {
 	if endTs == 0 {

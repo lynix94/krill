@@ -340,6 +340,12 @@ const dashboardHTML = `<!DOCTYPE html>
                         </div>
                     </div>
                 </div>
+                <div class="form-group" style="margin-top: 15px;">
+                    <label style="display: flex; align-items: center; cursor: pointer;">
+                        <input type="checkbox" id="enableProfiling" style="width: auto; margin-right: 8px;">
+                        <span>Enable Query Profiling (shows timing and I/O stats)</span>
+                    </label>
+                </div>
                 <button class="btn-execute" onclick="executeQuery()">Execute Query</button>
                 
                 <div id="queryResult" class="result-box" style="display: none;">
@@ -637,6 +643,7 @@ const dashboardHTML = `<!DOCTYPE html>
             const resultDiv = document.getElementById('queryResult');
             const outputPre = document.getElementById('queryOutput');
             const chartContainer = document.getElementById('chartContainer');
+            const enableProfiling = document.getElementById('enableProfiling').checked;
             
             // Start timing
             const startTime = performance.now();
@@ -645,7 +652,8 @@ const dashboardHTML = `<!DOCTYPE html>
                 let response, data;
                 
                 if (queryType === 'instant') {
-                    response = await fetch('/api/v1/query?query=' + encodeURIComponent(metric));
+                    const profileParam = enableProfiling ? '&profile=1' : '';
+                    response = await fetch('/api/v1/query?query=' + encodeURIComponent(metric) + profileParam);
                     data = await response.json();
                     
                     const endTime = performance.now();
@@ -683,9 +691,10 @@ const dashboardHTML = `<!DOCTYPE html>
                         step = 60; // 1 minute for ranges > 1 hour
                     }
                     
+                    const profileParam = enableProfiling ? '&profile=1' : '';
                     response = await fetch(
                         '/api/v1/query_range?query=' + encodeURIComponent(metric) + 
-                        '&start=' + start + '&end=' + end + '&step=' + step
+                        '&start=' + start + '&end=' + end + '&step=' + step + profileParam
                     );
                     data = await response.json();
                     
