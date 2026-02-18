@@ -385,7 +385,7 @@ func main() {
 	log.Printf("  - http://localhost%s/", *addr)
 	log.Printf("  - http://localhost%s/api/v1/query?query=cpu.usage", *addr)
 	log.Printf("  - http://localhost%s/api/v1/query_range?query=cpu.usage&start=%d&end=%d", *addr, now-3600, now)
-	log.Printf("  - http://localhost%s/api/v1/metrics", *addr)
+	log.Printf("  - http://localhost%s/api/v1/labels/__name__/values", *addr)
 	log.Printf("  - http://localhost%s/health", *addr)
 	log.Println("\nExample curl commands:")
 	log.Printf("  curl 'http://localhost%s/api/v1/query?query=cpu.usage'", *addr)

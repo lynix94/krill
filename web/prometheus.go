@@ -6,7 +6,6 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -715,8 +714,8 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 					return
 				}
 
-				// Apply step-based downsampling in parallel if step is specified
-				if step > 0 {
+				// Apply step-based downsampling in parallel if step > 1 (step=1 means raw data)
+				if step > 1 {
 					downsampleStart := time.Now()
 					timestamps, values = downsampleByStep(timestamps, values, start, end, step)
 					if profile != nil {
@@ -907,251 +906,7 @@ func (ph *PrometheusHandler) HandleBatchWrite(w http.ResponseWriter, r *http.Req
 	ph.sendSuccess(w, map[string]int{"written": len(points)})
 }
 
-// HandleMetrics returns list of all metrics: GET /api/v1/label/__name__/values or GET /api/v1/metrics
-// When called via /api/v1/label/__name__/values (Grafana), returns just metric names
-// When called via /api/v1/metrics, returns full metric strings with labels
-// Supports optional query parameters:
-//   - filter: regex pattern to filter metrics
-//   - limit: maximum number of metrics to return (default: no limit)
-//   - offset: number of metrics to skip for pagination (default: 0)
-func (ph *PrometheusHandler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		ph.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
 
-	// Check if this is a Grafana label values request
-	isLabelValuesRequest := strings.Contains(r.URL.Path, "/label/__name__/values")
-
-	// Get query parameters
-	filterParam := r.URL.Query().Get("filter")
-	limitParam := r.URL.Query().Get("limit")
-	offsetParam := r.URL.Query().Get("offset")
-
-	// Parse limit and offset
-	var limit, offset int
-	var err error
-
-	if limitParam != "" {
-		limit, err = strconv.Atoi(limitParam)
-		if err != nil || limit < 0 {
-			ph.sendError(w, http.StatusBadRequest, "invalid limit parameter")
-			return
-		}
-	}
-
-	if offsetParam != "" {
-		offset, err = strconv.Atoi(offsetParam)
-		if err != nil || offset < 0 {
-			ph.sendError(w, http.StatusBadRequest, "invalid offset parameter")
-			return
-		}
-	}
-
-	var filteredMetrics []string
-
-	if isLabelValuesRequest {
-		// Grafana label values request - return just metric names
-		allSeries, err := ph.tsdb.GetAllSeries()
-		if err != nil {
-			ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get series: %v", err))
-			return
-		}
-
-		// Extract unique metric names
-		metricNames := make(map[string]bool)
-		for _, series := range allSeries {
-			for _, label := range series {
-				if label.Name == "__name__" {
-					metricNames[label.Value] = true
-					break
-				}
-			}
-		}
-
-		// Convert to sorted slice
-		for name := range metricNames {
-			filteredMetrics = append(filteredMetrics, name)
-		}
-		sort.Strings(filteredMetrics)
-	} else {
-		// Regular metrics request - return full metric strings
-		allMetrics, err := ph.tsdb.GetMetrics()
-		if err != nil {
-			ph.sendError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		filteredMetrics = allMetrics
-	}
-
-	// Apply filter if specified
-	if filterParam != "" {
-		filterRegex, err := regexp.Compile(filterParam)
-		if err != nil {
-			ph.sendError(w, http.StatusBadRequest, fmt.Sprintf("invalid filter regex: %v", err))
-			return
-		}
-
-		var filtered []string
-		for _, metric := range filteredMetrics {
-			if filterRegex.MatchString(metric) {
-				filtered = append(filtered, metric)
-			}
-		}
-		filteredMetrics = filtered
-	}
-
-	totalCount := len(filteredMetrics)
-
-	// Apply pagination
-	start := offset
-	if start > totalCount {
-		start = totalCount
-	}
-
-	end := totalCount
-	if limit > 0 && start+limit < totalCount {
-		end = start + limit
-	}
-
-	paginatedMetrics := filteredMetrics[start:end]
-
-	// Send response
-	if isLabelValuesRequest {
-		// Grafana expects simple Prometheus response format
-		ph.sendSuccess(w, paginatedMetrics)
-	} else {
-		// Full response with pagination metadata for dashboard
-		response := map[string]interface{}{
-			"status": "success",
-			"data":   paginatedMetrics,
-			"metadata": map[string]interface{}{
-				"total":  totalCount,
-				"offset": offset,
-				"limit":  limit,
-				"count":  len(paginatedMetrics),
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}
-}
-
-// HandleLabels returns all label names (Grafana API)
-// GET /api/v1/labels
-func (ph *PrometheusHandler) HandleLabels(w http.ResponseWriter, r *http.Request) {
-	allSeries, err := ph.tsdb.GetAllSeries()
-	if err != nil {
-		ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get series: %v", err))
-		return
-	}
-
-	labelNames := make(map[string]bool)
-	for _, series := range allSeries {
-		for _, label := range series {
-			labelNames[label.Name] = true
-		}
-	}
-
-	result := make([]string, 0, len(labelNames))
-	for name := range labelNames {
-		result = append(result, name)
-	}
-	sort.Strings(result)
-
-	ph.sendSuccess(w, result)
-}
-
-// HandleLabelValues returns all values for a specific label (Grafana API)
-// GET /api/v1/label/<label_name>/values
-func (ph *PrometheusHandler) HandleLabelValues(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/label/"), "/")
-	if len(parts) < 2 || parts[1] != "values" {
-		ph.sendError(w, http.StatusBadRequest, "invalid URL format, expected /api/v1/label/<name>/values")
-		return
-	}
-	labelName := parts[0]
-
-	allSeries, err := ph.tsdb.GetAllSeries()
-	if err != nil {
-		ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get series: %v", err))
-		return
-	}
-
-	labelValues := make(map[string]bool)
-	for _, series := range allSeries {
-		for _, label := range series {
-			if label.Name == labelName {
-				labelValues[label.Value] = true
-			}
-		}
-	}
-
-	result := make([]string, 0, len(labelValues))
-	for value := range labelValues {
-		result = append(result, value)
-	}
-	sort.Strings(result)
-
-	ph.sendSuccess(w, result)
-}
-
-// HandleSeries returns series metadata matching label matchers (Grafana API)
-// GET /api/v1/series?match[]=<matcher>
-func (ph *PrometheusHandler) HandleSeries(w http.ResponseWriter, r *http.Request) {
-	matches := r.URL.Query()["match[]"]
-	if len(matches) == 0 {
-		ph.sendError(w, http.StatusBadRequest, "at least one match[] parameter required")
-		return
-	}
-
-	allSeries, err := ph.tsdb.GetAllSeries()
-	if err != nil {
-		ph.sendError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get series: %v", err))
-		return
-	}
-
-	type SeriesMeta struct {
-		Metric map[string]string `json:"metric"`
-	}
-
-	var result []SeriesMeta
-	for _, series := range allSeries {
-		labelsMap := make(map[string]string)
-		for _, label := range series {
-			labelsMap[label.Name] = label.Value
-		}
-
-		for _, match := range matches {
-			if matchesSimpleSelector(labelsMap, match) {
-				result = append(result, SeriesMeta{Metric: labelsMap})
-				break
-			}
-		}
-	}
-
-	ph.sendSuccess(w, result)
-}
-
-// matchesSimpleSelector checks if labels match a Prometheus selector
-func matchesSimpleSelector(labels map[string]string, selector string) bool {
-	selector = strings.TrimSpace(selector)
-
-	if !strings.Contains(selector, "{") {
-		metricName, ok := labels["__name__"]
-		return ok && metricName == selector
-	}
-
-	var metricName string
-	if idx := strings.Index(selector, "{"); idx > 0 {
-		metricName = selector[:idx]
-		if labelValue, ok := labels["__name__"]; !ok || labelValue != metricName {
-			return false
-		}
-	}
-
-	return true // Simplified: just check metric name
-}
 
 // buildMetricKey creates a metric key with tags
 // Format: metric_name{tag1="value1",tag2="value2"}
@@ -1649,8 +1404,8 @@ func (ph *PrometheusHandler) HandleKrillQL(w http.ResponseWriter, r *http.Reques
 				}
 
 				if len(values) > 0 {
-					// Apply step-based downsampling if step is specified
-					if firstStage.Step > 0 {
+					// Apply step-based downsampling if step > 1 (step=1 means raw data)
+					if firstStage.Step > 1 {
 						timestamps, values = downsampleByStep(timestamps, values, firstStage.Start, firstStage.End, firstStage.Step)
 					}
 

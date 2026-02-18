@@ -464,7 +464,7 @@ ps aux | grep krill-server
 
 ```bash
 # 메트릭 목록 확인
-curl http://localhost:9090/api/v1/metrics
+curl http://localhost:9090/api/v1/labels/__name__/values
 
 # 시간 범위 확대
 krill-cli query_range cpu.usage 0 9999999999

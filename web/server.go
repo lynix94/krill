@@ -5,7 +5,6 @@ import (
 	"log"
 	"net/http"
 	"net/http/pprof"
-	"strings"
 	"time"
 
 	"github.com/lynix/krill"
@@ -53,21 +52,16 @@ func NewServer(opts ServerOptions) *Server {
 	mux.HandleFunc("/api/v1/query_range", handler.HandleQueryRange)
 	mux.HandleFunc("/api/v1/write", handler.HandleWrite)
 	mux.HandleFunc("/api/v1/write/batch", handler.HandleBatchWrite)
-	mux.HandleFunc("/api/v1/metrics", handler.HandleMetrics)
 
 	// Grafana-compatible API endpoints (must be before specific paths)
 	mux.HandleFunc("/api/v1/labels", handler.HandleLabels)
+	mux.HandleFunc("/api/v1/labels/", handler.HandleLabelValues)
 	mux.HandleFunc("/api/v1/series", handler.HandleSeries)
 
-	// Label values endpoint - handles both __name__ and custom labels
+	// Label values endpoint
 	// This must be registered as a catch-all for /api/v1/label/
 	mux.HandleFunc("/api/v1/label/", func(w http.ResponseWriter, r *http.Request) {
-		// Check if it's asking for __name__ values (metric names)
-		if strings.HasPrefix(r.URL.Path, "/api/v1/label/__name__/values") {
-			handler.HandleMetrics(w, r)
-		} else {
-			handler.HandleLabelValues(w, r)
-		}
+		handler.HandleLabelValues(w, r)
 	})
 
 	// Pprof profiling endpoints

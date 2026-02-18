@@ -896,7 +896,7 @@ func handleMetrics(args []string) error {
 	}
 
 	// Build URL with optional metric name filter
-	queryURL := serverURL + "/api/v1/metrics"
+	queryURL := serverURL + "/api/v1/labels/__name__/values"
 	if metricFilter != "" {
 		queryURL += "?filter=" + url.QueryEscape(metricFilter)
 	}

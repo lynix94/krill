@@ -131,7 +131,9 @@ const dashboardHTML = `<!DOCTYPE html>
         }
         .chart-container {
             position: relative;
-            height: 350px;
+            min-height: 450px;
+            height: 60vh;
+            max-height: 700px;
             margin-top: 20px;
         }
         .metric-list {
@@ -305,14 +307,15 @@ const dashboardHTML = `<!DOCTYPE html>
                 <div class="form-group">
                     <label for="queryType">Query Type:</label>
                     <select id="queryType" onchange="toggleTimeRange()">
+                        <option value="range" selected>Range Query (Time Series)</option>
                         <option value="instant">Instant Query (Latest Value)</option>
-                        <option value="range">Range Query (Time Series)</option>
                     </select>
                 </div>
-                <div id="timeRangeGroup" class="form-group" style="display: none;">
+                <div id="timeRangeGroup" class="form-group" style="display: block;">
                     <div class="form-group">
                         <label for="quickTimeRange">Quick Time Range:</label>
-                        <select id="quickTimeRange" onchange="applyQuickRange()">
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <select id="quickTimeRange" onchange="applyQuickRange()">
                             <option value="">-- Select a time range --</option>
                             <option value="300">Last 5 minutes</option>
                             <option value="900">Last 15 minutes</option>
@@ -326,18 +329,31 @@ const dashboardHTML = `<!DOCTYPE html>
                             <option value="604800">Last 7 days</option>
                             <option value="2592000">Last 30 days</option>
                             <option value="7776000">Last 90 days</option>
-                        </select>
+                            </select>
+                            <button class="btn-execute" type="button" onclick="refreshQuickRange()" style="padding: 4px 8px; font-size: 0.8em; width: auto; min-width: 0; display: inline-flex; align-items: center; justify-content: center;">Refresh</button>
+                        </div>
                     </div>
                     <label>Custom Range:</label>
                     <div class="time-range">
                         <div>
                             <label for="startTime">From:</label>
-                            <input type="datetime-local" id="startTime">
+                            <input type="datetime-local" id="startTime" step="1">
                         </div>
                         <div>
                             <label for="endTime">To:</label>
-                            <input type="datetime-local" id="endTime">
+                            <input type="datetime-local" id="endTime" step="1">
                         </div>
+                    </div>
+                    <div style="margin-top: 10px;">
+                        <label style="display: inline-flex; align-items: center; margin-right: 10px;">
+                            <input type="checkbox" id="autoStep" checked onchange="toggleStepInput()" style="margin-right: 5px;">
+                            Auto Step
+                        </label>
+                        <label for="stepInput" style="display: inline-flex; align-items: center;">
+                            Step (seconds):
+                            <input type="number" id="stepInput" min="1" value="15" disabled style="margin-left: 5px; width: 80px; padding: 4px;">
+                        </label>
+                        <small style="margin-left: 5px; color: #888;">(1 = raw data)</small>
                     </div>
                 </div>
                 <button class="btn-execute" onclick="executeQuery()">Execute Query</button>
@@ -381,7 +397,7 @@ const dashboardHTML = `<!DOCTYPE html>
                     <input type="number" id="writeValue" step="0.01" placeholder="e.g., 42.5">
                 </div>
                 <div class="form-group">
-                    <label for="writeTags">Tags (JSON, optional):</label>
+                    <label for="writeTags">Labels (JSON, optional):</label>
                     <input type="text" id="writeTags" placeholder='e.g., {"host":"server1","env":"prod"}'>
                 </div>
                 <div class="form-group">
@@ -453,6 +469,8 @@ const dashboardHTML = `<!DOCTYPE html>
         window.addEventListener('DOMContentLoaded', function() {
             loadMetrics();
             setupAutocomplete();
+            toggleTimeRange();
+            applyQuickRange();
         });
 
         function switchTab(tab) {
@@ -591,7 +609,8 @@ const dashboardHTML = `<!DOCTYPE html>
             const day = String(date.getDate()).padStart(2, '0');
             const hours = String(date.getHours()).padStart(2, '0');
             const minutes = String(date.getMinutes()).padStart(2, '0');
-            return year + '-' + month + '-' + day + 'T' + hours + ':' + minutes;
+            const seconds = String(date.getSeconds()).padStart(2, '0');
+            return year + '-' + month + '-' + day + 'T' + hours + ':' + minutes + ':' + seconds;
         }
 
         function setTimeRange(seconds) {
@@ -609,9 +628,19 @@ const dashboardHTML = `<!DOCTYPE html>
             }
         }
 
+        function refreshQuickRange() {
+            applyQuickRange();
+        }
+
+        function toggleStepInput() {
+            const autoStep = document.getElementById('autoStep').checked;
+            const stepInput = document.getElementById('stepInput');
+            stepInput.disabled = autoStep;
+        }
+
         async function loadMetrics() {
             try {
-                const response = await fetch('/api/v1/label/__name__/values');
+                const response = await fetch('/api/v1/labels/__name__/values');
                 const data = await response.json();
                 
                 if (data.status === 'success' && data.data) {
@@ -705,21 +734,31 @@ const dashboardHTML = `<!DOCTYPE html>
                     const start = Math.floor(new Date(startInput).getTime() / 1000);
                     const end = Math.floor(new Date(endInput).getTime() / 1000);
                     
-                    // Calculate appropriate step based on time range
+                    // Calculate appropriate step based on time range or use manual input
                     const timeRange = end - start;
-                    let step = 15; // default 15 seconds
-                    if (timeRange > 604800) {
-                        step = 3600; // 1 hour for ranges > 7 days
-                    } else if (timeRange > 86400) {
-                        step = 600; // 10 minutes for ranges > 1 day
-                    } else if (timeRange > 3600) {
-                        step = 60; // 1 minute for ranges > 1 hour
+                    let step;
+                    
+                    if (document.getElementById('autoStep').checked) {
+                        // Auto calculate step
+                        step = 15; // default 15 seconds
+                        if (timeRange > 604800) {
+                            step = 3600; // 1 hour for ranges > 7 days
+                        } else if (timeRange > 86400) {
+                            step = 600; // 10 minutes for ranges > 1 day
+                        } else if (timeRange > 3600) {
+                            step = 60; // 1 minute for ranges > 1 hour
+                        }
+                    } else {
+                        // Use manual input (minimum 1 for raw data)
+                        const inputValue = parseInt(document.getElementById('stepInput').value);
+                        step = isNaN(inputValue) || inputValue < 1 ? 15 : inputValue;
                     }
                     
-                    response = await fetch(
-                        '/api/v1/query_range?query=' + encodeURIComponent(metric) + 
-                        '&start=' + start + '&end=' + end + '&step=' + step + '&profile=1'
-                    );
+                    // Build query URL with step parameter
+                    let queryUrl = '/api/v1/query_range?query=' + encodeURIComponent(metric) + 
+                        '&start=' + start + '&end=' + end + '&step=' + step + '&profile=1';
+                    
+                    response = await fetch(queryUrl);
                     const responseReceivedTime = performance.now();
                     data = await response.json();
                     
@@ -776,10 +815,21 @@ const dashboardHTML = `<!DOCTYPE html>
                     outputPre.textContent = '\n\n' + JSON.stringify(data, null, 2);
                     outputPre.prepend(header);
                     
-                    // Draw chart
+                    // Draw chart with all series
                     if (data.status === 'success' && data.data.result && data.data.result.length > 0) {
-                        drawChart(data.data.result[0], metric, start, end, step);
-                        chartContainer.style.display = 'block';
+                        const seriesWithData = data.data.result.filter(s => s.values && s.values.length > 0);
+                        if (seriesWithData.length > 0) {
+                            drawChart(seriesWithData, metric, start, end, step);
+                            chartContainer.style.display = 'block';
+                        } else {
+                            chartContainer.style.display = 'block';
+                            const canvas = document.getElementById('metricsChart');
+                            const ctx = canvas.getContext('2d');
+                            ctx.clearRect(0, 0, canvas.width, canvas.height);
+                            ctx.font = '14px Arial';
+                            ctx.fillStyle = '#666';
+                            ctx.fillText('No data points to display', 10, 20);
+                        }
                     }
                 }
                 
@@ -803,7 +853,7 @@ const dashboardHTML = `<!DOCTYPE html>
             }
         }
 
-        function drawChart(result, metricName, start, end, step) {
+        function drawChart(seriesArray, metricName, start, end, step) {
             const canvas = document.getElementById('metricsChart');
             const ctx = canvas.getContext('2d');
             
@@ -811,82 +861,184 @@ const dashboardHTML = `<!DOCTYPE html>
                 chart.destroy();
             }
             
-            // Create a map of existing data points
-            const dataMap = new Map();
-            let firstDataTs = null;
-            let lastDataTs = null;
+            // Colors for different series
+            const colors = [
+                'rgb(102, 126, 234)',
+                'rgb(118, 75, 162)',
+                'rgb(240, 147, 251)',
+                'rgb(79, 172, 254)',
+                'rgb(0, 242, 254)',
+                'rgb(245, 87, 108)',
+                'rgb(255, 159, 64)',
+                'rgb(75, 192, 192)',
+                'rgb(153, 102, 255)',
+                'rgb(255, 205, 86)'
+            ];
             
-            if (result.values && result.values.length > 0) {
-                result.values.forEach(point => {
-                    const ts = point[0];
-                    dataMap.set(ts, parseFloat(point[1]));
-                    if (firstDataTs === null || ts < firstDataTs) firstDataTs = ts;
-                    if (lastDataTs === null || ts > lastDataTs) lastDataTs = ts;
-                });
-            }
+            // Collect all unique timestamps across all series
+            const allTimestamps = new Set();
+            seriesArray.forEach(series => {
+                if (series.values) {
+                    series.values.forEach(point => allTimestamps.add(point[0]));
+                }
+            });
             
-            // If no data, return empty chart
-            if (firstDataTs === null) {
+            // Sort timestamps
+            const sortedTimestamps = Array.from(allTimestamps).sort((a, b) => a - b);
+            
+            if (sortedTimestamps.length === 0) {
                 return;
             }
             
-            // Generate timestamps from first data point to last data point
-            const labels = [];
-            const values = [];
-            
-            for (let ts = firstDataTs; ts <= lastDataTs; ts += step) {
+            // Create labels from timestamps with smart formatting
+            let prevDate = null;
+            let prevHour = null;
+            const labels = sortedTimestamps.map(ts => {
                 const date = new Date(ts * 1000);
-                labels.push(date.toLocaleString());
+                const year = date.getFullYear();
+                const month = String(date.getMonth() + 1).padStart(2, '0');
+                const day = String(date.getDate()).padStart(2, '0');
+                const hour = String(date.getHours()).padStart(2, '0');
+                const minute = String(date.getMinutes()).padStart(2, '0');
+                const second = String(date.getSeconds()).padStart(2, '0');
                 
-                // Use the actual value if it exists, otherwise null (will show as gap)
-                if (dataMap.has(ts)) {
-                    values.push(dataMap.get(ts));
+                const currentDate = year + '-' + month + '-' + day;
+                const currentHour = hour;
+                
+                let label;
+                if (prevDate === null || prevDate !== currentDate) {
+                    // Different date: show full date and time
+                    label = month + '-' + day + ' ' + hour + ':' + minute + ':' + second;
+                    prevDate = currentDate;
+                    prevHour = currentHour;
+                } else if (prevHour !== currentHour) {
+                    // Same date, different hour: show hour:minute:second
+                    label = hour + ':' + minute + ':' + second;
+                    prevHour = currentHour;
                 } else {
-                    values.push(null);
+                    // Same hour: show minute:second only
+                    label = minute + ':' + second;
                 }
-            }
+                
+                return label;
+            });
+            
+            // Create datasets for each series
+            const datasets = seriesArray.map((series, index) => {
+                // Create a map for quick lookup
+                const dataMap = new Map();
+                if (series.values) {
+                    series.values.forEach(point => {
+                        dataMap.set(point[0], parseFloat(point[1]));
+                    });
+                }
+                
+                // Build data array matching timestamps
+                const data = sortedTimestamps.map(ts => dataMap.has(ts) ? dataMap.get(ts) : null);
+                
+                // Create series label from metric tags
+                let seriesLabel = metricName;
+                if (series.metric) {
+                    const tags = Object.entries(series.metric)
+                        .filter(([key]) => key !== '__name__')
+                        .map(([key, value]) => key + '="' + value + '"')
+                        .join(', ');
+                    if (tags) {
+                        seriesLabel = metricName + '{' + tags + '}';
+                    }
+                }
+                
+                const color = colors[index % colors.length];
+                return {
+                    label: seriesLabel,
+                    data: data,
+                    borderColor: color,
+                    backgroundColor: color.replace('rgb', 'rgba').replace(')', ', 0.1)'),
+                    tension: 0.1,
+                    fill: false,
+                    spanGaps: false,
+                    pointRadius: 2,
+                    pointHoverRadius: 5,
+                    borderWidth: 2
+                };
+            });
             
             chart = new Chart(ctx, {
                 type: 'line',
                 data: {
                     labels: labels,
-                    datasets: [{
-                        label: metricName,
-                        data: values,
-                        borderColor: 'rgb(102, 126, 234)',
-                        backgroundColor: 'rgba(102, 126, 234, 0.1)',
-                        tension: 0.4,
-                        fill: true,
-                        spanGaps: false  // Don't connect across null values
-                    }]
+                    datasets: datasets
                 },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false
+                    },
                     plugins: {
                         legend: {
                             display: true,
-                            position: 'top'
+                            position: 'top',
+                            maxHeight: 120,
+                            labels: {
+                                boxWidth: 10,
+                                font: {
+                                    size: 10
+                                },
+                                padding: 8,
+                                generateLabels: function(chart) {
+                                    const labels = Chart.defaults.plugins.legend.labels.generateLabels(chart);
+                                    // Limit to first 10 series in legend, rest can be seen in tooltip
+                                    if (labels.length > 10) {
+                                        const visibleLabels = labels.slice(0, 10);
+                                        visibleLabels.push({
+                                            text: '... +' + (labels.length - 10) + ' more (hover to see all)',
+                                            fillStyle: '#999',
+                                            hidden: false,
+                                            lineCap: 'butt',
+                                            lineDash: [],
+                                            lineDashOffset: 0,
+                                            lineJoin: 'miter',
+                                            lineWidth: 0,
+                                            strokeStyle: '#999',
+                                            pointStyle: 'circle',
+                                            datasetIndex: -1
+                                        });
+                                        return visibleLabels;
+                                    }
+                                    return labels;
+                                }
+                            }
                         },
                         tooltip: {
                             callbacks: {
                                 label: function(context) {
                                     if (context.parsed.y === null) {
-                                        return metricName + ': No data';
+                                        return context.dataset.label + ': No data';
                                     }
-                                    return metricName + ': ' + context.parsed.y;
+                                    return context.dataset.label + ': ' + context.parsed.y.toFixed(6);
                                 }
                             }
                         }
                     },
                     scales: {
                         y: {
-                            beginAtZero: false
+                            beginAtZero: false,
+                            ticks: {
+                                callback: function(value) {
+                                    return value.toFixed(2);
+                                }
+                            }
                         },
                         x: {
                             ticks: {
-                                maxRotation: 45,
-                                minRotation: 45
+                                maxRotation: 0,
+                                minRotation: 0,
+                                maxTicksLimit: 15,
+                                font: {
+                                    size: 10
+                                }
                             }
                         }
                     }
@@ -971,6 +1123,7 @@ const dashboardHTML = `<!DOCTYPE html>
         let cachedMetrics = [];
         let currentPage = 1;
         const pageSize = 100; // Show 100 metrics per page
+        const seriesCache = {};
         
         async function loadAllMetrics() {
             const startTime = performance.now();
@@ -981,7 +1134,7 @@ const dashboardHTML = `<!DOCTYPE html>
             
             try {
                 const filter = document.getElementById('metricsFilter').value.trim();
-                let url = '/api/v1/metrics';
+                let url = '/api/v1/labels/__name__/values';
                 const params = new URLSearchParams();
                 
                 if (filter) {
@@ -1090,8 +1243,14 @@ const dashboardHTML = `<!DOCTYPE html>
             
             pageMetrics.forEach((metric, index) => {
                 const globalIndex = start + index + 1;
+                const safeMetricAttr = encodeURIComponent(metric);
+                const seriesId = 'series_' + globalIndex;
                 html += '<div style="padding: 8px; border-bottom: 1px solid #eee; font-family: monospace; font-size: 0.95em;">';
-                html += globalIndex + '. ' + metric;
+                html += '<div style="display: flex; align-items: center; justify-content: space-between;">';
+                html += '<div style="cursor: pointer; color: #2b6cb0;" data-metric="' + safeMetricAttr + '" data-series-id="' + seriesId + '" onclick="toggleSeries(this.dataset.metric, this.dataset.seriesId)">' + globalIndex + '. ' + metric + '</div>';
+                html += '<div style="cursor: pointer; color: #718096; padding-left: 8px;" title="Copy metric" onclick="copyText(\'' + safeMetricAttr + '\')">📋</div>';
+                html += '</div>';
+                html += '<div id="' + seriesId + '" style="margin-top: 6px; padding-left: 16px; display: none;"></div>';
                 html += '</div>';
             });
             
@@ -1112,6 +1271,85 @@ const dashboardHTML = `<!DOCTYPE html>
         function filterMetrics() {
             currentPage = 1; // Reset to first page
             loadAllMetrics();
+        }
+
+        async function toggleSeries(metric, containerId) {
+            metric = decodeURIComponent(metric);
+            const container = document.getElementById(containerId);
+            if (!container) return;
+
+            if (container.style.display === 'none') {
+                container.style.display = 'block';
+            } else {
+                container.style.display = 'none';
+                return;
+            }
+
+            if (container.dataset.loaded === 'true') {
+                return;
+            }
+
+            container.innerHTML = '<div style="color:#666;">Loading series...</div>';
+
+            try {
+                const url = '/api/v1/series?match[]=' + encodeURIComponent(metric);
+                const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status + ': ' + response.statusText);
+                }
+                const data = await response.json();
+                if (data.status !== 'success') {
+                    throw new Error(data.error || 'Unknown error');
+                }
+
+                const seriesList = data.data || [];
+                if (seriesList.length === 0) {
+                    container.innerHTML = '<div style="color:#999;">No series found</div>';
+                    container.dataset.loaded = 'true';
+                    return;
+                }
+
+                let html = '<div style="color:#444; font-size: 0.9em; margin-bottom: 4px;">Series: ' + seriesList.length + '</div>';
+                html += '<div style="max-height: 200px; overflow-y: auto; border-left: 2px solid #e2e8f0; padding-left: 8px;">';
+
+                seriesList.forEach((s, idx) => {
+                    const labels = s.metric || {};
+                    const entries = Object.entries(labels).map(([k, v]) => k + '="' + v + '"').join(', ');
+                    const encoded = encodeURIComponent('{' + entries + '}');
+                    html += '<div style="display: flex; align-items: center; justify-content: space-between; padding: 4px 0; font-family: monospace;">';
+                    html += '<div>' + (idx + 1) + '. {' + entries + '}</div>';
+                    html += '<div style="cursor: pointer; color: #718096; padding-left: 8px;" title="Copy series" onclick="copyText(\'' + encoded + '\')">📋</div>';
+                    html += '</div>';
+                });
+
+                html += '</div>';
+                container.innerHTML = html;
+                container.dataset.loaded = 'true';
+            } catch (error) {
+                container.innerHTML = '<div style="color:#c53030;">Error: ' + error.message + '</div>';
+            }
+        }
+
+        async function copyText(encodedText) {
+            const text = decodeURIComponent(encodedText);
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(text);
+                    return;
+                }
+            } catch (_) {
+                // fallback below
+            }
+
+            const temp = document.createElement('textarea');
+            temp.value = text;
+            temp.setAttribute('readonly', '');
+            temp.style.position = 'absolute';
+            temp.style.left = '-9999px';
+            document.body.appendChild(temp);
+            temp.select();
+            document.execCommand('copy');
+            document.body.removeChild(temp);
         }
     </script>
 </body>
