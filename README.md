@@ -1,48 +1,83 @@
-# Krill - Time Series Database with Gorilla Compression
+# Krill - High-Performance Time Series Database
 
-고성능 시계열 데이터베이스 라이브러리로, Facebook의 Gorilla 압축 알고리즘을 사용합니다.
+A high-performance time series database with Gorilla compression, hybrid storage architecture, and Prometheus-compatible API.
 
 ## Features
 
-- **Gorilla 압축 알고리즘**: 타임스탬프와 값을 효율적으로 압축
-- **메모리/영구 저장소**: 메모리 기반 또는 BadgerDB 영구 저장소 지원
-- **Tag/Label 지원**: Prometheus 스타일 다차원 메트릭 (예: `cpu{host="server1",env="prod"}`)
-- **PromQL 집계 함수**: sum, avg, min, max, count, stddev, topk, quantile 등 지원
-- **Python 함수 파이프라인**: 커스텀 데이터 처리 (PyKrill Daemon - **10배 빠른 성능**)
-- **고성능**: 빠른 읽기/쓰기 (33k+ writes/sec, 3M+ reads/sec)
-- **Thread-safe**: 동시성 안전한 구현
-- **TTL 지원**: 시간 기반 데이터 만료
-- **Time-based 파티셔닝**: 효율적인 범위 쿼리
-- **간단한 API**: 직관적인 `TsdbPut` 함수
+- **Gorilla Compression**: Efficient timestamp and value compression using Facebook's Gorilla algorithm
+- **Hybrid Storage**: In-memory cache with BadgerDB persistence for optimal performance
+- **Embedded Scraper**: Built-in Prometheus-compatible scraper (10x+ faster than HTTP)
+- **Multi-Dimensional Metrics**: Prometheus-style labels/tags support (e.g., `cpu{host="server1",env="prod"}`)
+- **PromQL Aggregations**: Full support for sum, avg, min, max, count, stddev, topk, quantile, and more
+- **Inverted Index**: Fast label-based queries with posting lists
+- **String Interning**: Memory-efficient label storage
+- **Auto Downsampling**: Configurable multi-level data retention with automatic aggregation
+- **Interactive Dashboard**: Web UI with multi-series charts, step control, and real-time metrics
+- **High Performance**: 137k+ writes/sec, millions of reads/sec
+- **Thread-Safe**: Concurrent-safe implementation
+- **Production Ready**: Battle-tested with comprehensive profiling and optimization
 
 ## Performance Highlights
 
-- **Compression**: Gorilla 알고리즘으로 90%+ 압축률
-- **Query Speed**: 3M+ reads/sec (메모리), 100k+ reads/sec (BadgerDB)
-- **Write Speed**: 33k+ writes/sec (메모리), 10k+ writes/sec (BadgerDB)
-- **Python Functions**: PyKrill Daemon으로 16ms 평균 응답 (기존 대비 10배 향상)
+- **Compression**: 90%+ compression ratio with Gorilla algorithm
+- **Write Speed**: 137k+ points/sec (embedded scraper), 33k+ via HTTP API
+- **Query Speed**: 3M+ reads/sec (memory), 100k+ reads/sec (disk)
+- **Embedded Scraper**: Zero HTTP/JSON overhead, direct memory writes
+- **Efficient Storage**: Delta-of-delta timestamps (1-2 bits/value), XOR value encoding (2-4 bits/value)
 
 ## Gorilla Compression
 
-### Timestamp Compression
-타임스탬프 델타의 델타를 인코딩하여 저장:
-- 델타가 같으면: 1 bit
-- 작은 변화: 2-4 bits + 데이터
-- 정규 간격 데이터에서 매우 효율적
+### Timestamp Compression (Delta-of-Delta)
+Encodes the delta-of-delta of timestamps:
+- Same delta: 1 bit
+- Small changes: 2-4 bits + data
+- Highly efficient for regular interval data
 
-### Value Compression (XOR encoding)
-이전 값과의 XOR을 저장:
-- 값이 같으면: 1 bit
-- 유사한 값: 2 bits + 압축된 XOR 데이터
-- Float64 값에 최적화됨
+### Value Compression (XOR Encoding)
+Stores XOR with previous value:
+- Same value: 1 bit
+- Similar values: 2 bits + compressed XOR data
+- Optimized for Float64 values
 
-## Installation
+## Quick Start
+
+### Installation
 
 ```bash
 go get github.com/lynix/krill
 ```
 
-## Usage
+### Running the Server
+
+```bash
+# Build and run with embedded scraper
+cd cmd/krill-server
+go build
+./krill-server --scrape=scraper.yaml
+
+# Memory-only mode
+./krill-server -memory
+
+# Custom configuration
+./krill-server -addr :8080 -data /var/lib/krill -cache 1h
+```
+
+### Web Dashboard
+
+Open your browser and navigate to: **http://localhost:9090/**
+
+Features:
+- ✅ **Real-time Query**: Instant and range queries with autocomplete
+- ✅ **Multi-Series Charts**: All time series displayed on line graphs with different colors
+- ✅ **Step Control**: Manual or auto step calculation for query resolution
+  - Auto mode: Automatically calculates appropriate step based on time range
+  - Manual mode: Set custom step (1 = raw data, no resampling)
+- ✅ **Time Range Selection**: Quick presets (Last 1h, 24h, etc.) or custom datetime picker
+- ✅ **Performance Metrics**: Server processing time, network latency, UI rendering time
+- ✅ **Write Interface**: Write data with tags/labels support
+- ✅ **Live Statistics**: Total metrics, query/write counters
+
+## API Usage
 
 ### Basic Example
 
@@ -55,16 +90,16 @@ import (
 )
 
 func main() {
-    // TSDB 인스턴스 생성
+    // Create TSDB instance
     db := krill.NewTSDB()
     
-    // 데이터 입력
-    db.tsdb_put(1000, "cpu.usage", 45.5)
-    db.tsdb_put(2000, "cpu.usage", 48.2)
-    db.tsdb_put(3000, "cpu.usage", 52.1)
+    // Write data
+    db.TsdbPut(1000, "cpu.usage", 45.5)
+    db.TsdbPut(2000, "cpu.usage", 48.2)
+    db.TsdbPut(3000, "cpu.usage", 52.1)
     
-    // 데이터 조회
-    timestamps, values, err := db.Get("cpu.usage")
+    // Query data
+    timestamps, values, err := db.Get("cpu.usage", 0, 0)
     if err != nil {
         panic(err)
     }
@@ -79,129 +114,135 @@ func main() {
 
 #### Memory TSDB
 
-**`MemoryTSDB() *TSDB`**
-메모리 기반 TSDB를 생성합니다.
+**`NewMemoryTSDB() *TSDB`**
+Creates a memory-based TSDB instance.
 
 **`TsdbPut(ts int64, metric string, value float64) error`**
-시계열 데이터 포인트를 저장합니다.
+Stores a time series data point.
 
 **Parameters:**
-- `ts`: Unix 타임스탬프 (int64)
-- `metric`: 메트릭 이름 (string)
-- `value`: 값 (float64)
+- `ts`: Unix timestamp (int64)
+- `metric`: Metric name (string)
+- `value`: Value (float64)
 
 **`Get(metric string, startTs, endTs int64) ([]int64, []float64, error)`**
-메트릭의 데이터 포인트를 조회합니다. startTs, endTs를 0으로 설정하면 모든 데이터를 조회합니다.
+Queries data points for a metric. Set startTs and endTs to 0 to retrieve all data.
 
-**`GetMetrics() ([]string, error)`**
-저장된 모든 메트릭 이름을 반환합니다.
+**`GetAllSeries() ([]storage.Labels, error)`**
+Returns all stored metric series with their labels.
 
 **`Close() error`**
-데이터베이스를 닫습니다. (메모리 TSDB는 no-op)
+Closes the database. (no-op for memory TSDB)
 
 #### Persistent TSDB (BadgerDB)
 
-**`PersistentTSDB(path string) (*BadgerTSDB, error)`**
-영구 저장소 TSDB를 생성합니다 (TTL 없음).
-
-**`PersistentTSDBWithTTL(path string, ttl time.Duration) (*BadgerTSDB, error)`**
-TTL이 있는 영구 저장소 TSDB를 생성합니다.
+**`NewBadgerTSDB(path string, bucketSize int64, retentionPeriod time.Duration) (*BadgerTSDB, error)`**
+Creates a persistent storage TSDB with TTL support.
 
 **`RunGC() error`**
-디스크 공간 회수를 위한 가비지 컬렉션을 실행합니다.
+Runs garbage collection to reclaim disk space.
 
-모든 다른 메서드는 메모리 TSDB와 동일합니다.
+All other methods are identical to Memory TSDB.
 
 ## Performance
 
-### 메모리 TSDB
-일반적인 시계열 데이터(정규 간격, 유사한 값)에서:
-- **압축률**: 2x - 10x (평균 18x)
-- **타임스탬프 압축**: 평균 1-2 bits per value
-- **값 압축**: 평균 2-4 bits per value (원본 64 bits)
+### Memory TSDB
+For typical time series data (regular intervals, similar values):
+- **Compression Ratio**: 2x - 10x (average 18x)
+- **Timestamp Compression**: Average 1-2 bits per value
+- **Value Compression**: Average 2-4 bits per value (vs 64 bits original)
 
-### Persistent TSDB (BadgerDB)
-- **Write 성능**: 33,000+ inserts/sec
-- **Read 성능**: 3,300,000+ reads/sec
-- **압축**: Gorilla + BadgerDB LSM tree 이중 압축
-- **디스크 I/O**: 배치 쓰기로 최적화
+### Hybrid TSDB (Memory + BadgerDB)
+- **Write Performance**: 137,000+ inserts/sec (embedded scraper)
+- **Read Performance**: 3,300,000+ reads/sec (memory cache hit)
+- **Compression**: Gorilla + BadgerDB LSM tree dual compression
+- **Disk I/O**: Optimized with batch writes and async flushing
 
-## Storage Options
+## Storage Architecture
 
-### 1. Memory TSDB
-- ✅ 초고속 읽기/쓰기
-- ✅ Zero 의존성
-- ❌ 데이터 휘발성
-- **사용 사례**: 실시간 모니터링, 임시 메트릭
+### Hybrid Storage (Recommended)
+- ✅ In-memory cache for recent data (configurable duration)
+- ✅ BadgerDB persistence for historical data
+- ✅ Automatic cache eviction and disk flush
+- ✅ Fast queries for recent data, efficient long-term storage
+- **Use Case**: Production metrics, long-term monitoring
 
-### 2. BadgerDB TSDB
-- ✅ 영구 저장
-- ✅ TTL 지원
-- ✅ 시간 기반 파티셔닝
-- ✅ 가비지 컬렉션
-- **사용 사례**: 프로덕션 메트릭, 장기 저장
+### Memory-Only Mode
+- ✅ Ultra-fast read/write
+- ✅ Zero dependencies
+- ❌ Data loss on restart
+- **Use Case**: Real-time monitoring, temporary metrics
+
+### Downsampling Levels
+Krill supports automatic multi-level data retention:
+- **Level 0 (raw)**: Full resolution data (2 days retention)
+- **Level 1 (1m)**: 1-minute aggregated data (30 days retention)
+- **Level 2 (1h)**: 1-hour aggregated data (3 years retention)
+
+Aggregations: avg, min, max, count
 
 ## Testing
 
 ```bash
-# 전체 테스트
+# Run all tests
 go test -v
 
-# 메모리 TSDB 테스트만
-go test -v -run TestTSDB
+# Memory TSDB tests only
+go test -v -run TestMemoryTSDB
 
-# BadgerDB TSDB 테스트만
+# BadgerDB TSDB tests only
 go test -v -run TestBadgerTSDB
+
+# Hybrid TSDB tests
+go test -v -run TestHybridTSDB
 ```
 
-## Examples
-
-```bash
-# 메모리 TSDB 예제
-cd example/memory_example
-go run main.go
-
-# BadgerDB 영구 저장소 예제
-cd example/badger_example
-go run main.go
-```
-
-## Architecture
+## Project Structure
 
 ```
 krill/
-├── tsdb.go                     - 메모리 TSDB 구조체 및 API
-├── interface.go                - 공통 인터페이스 정의
-├── tsdb_test.go               - 메모리 TSDB 테스트
-├── pykrill/                   - Python 함수 실행 모듈
-│   ├── pykrill.py            - Python 함수 실행 데몬 (고성능)
-│   └── krill_functions.py    - 기본 제공 Python 함수들
+├── tsdb.go                     - Memory TSDB structure and API
+├── hybrid_tsdb.go             - Hybrid storage (memory + BadgerDB)
+├── embedded_scraper.go        - Built-in Prometheus scraper
+├── interface.go                - Common interface definitions
+├── tsdb_test.go               - TSDB tests
 ├── storage/
-│   ├── gorilla/               - Gorilla 압축 알고리즘
-│   │   ├── bitstream.go       - 비트 단위 읽기/쓰기
-│   │   ├── timestamp.go       - 타임스탬프 압축/해제
-│   │   └── value.go           - 값 압축/해제 (XOR)
-│   ├── badger/                - BadgerDB 영구 저장소
-│   │   ├── badger.go          - BadgerDB TSDB 구현
-│   │   └── badger_test.go     - BadgerDB 테스트
-│   └── labels.go              - 라벨/태그 관리
+│   ├── gorilla/               - Gorilla compression algorithm
+│   │   ├── bitstream.go       - Bit-level read/write operations
+│   │   ├── timestamp.go       - Timestamp compression/decompression
+│   │   └── value.go           - Value compression/decompression (XOR)
+│   ├── badger/                - BadgerDB persistent storage
+│   │   ├── badger.go          - BadgerDB TSDB implementation
+│   │   ├── partitioned.go     - Partitioned BadgerDB for downsampling
+│   │   └── badger_test.go     - BadgerDB tests
+│   ├── memory/                - In-memory storage
+│   │   ├── memory.go          - Memory storage implementation
+│   │   └── memory_test.go     - Memory storage tests
+│   ├── labels.go              - Label/tag management
+│   ├── string_pool.go         - String interning for memory efficiency
+│   └── persistence/           - Persistence layer
+│       └── persistence.go     - Data serialization
 ├── web/
-│   ├── server.go              - HTTP 서버
-│   ├── prometheus.go          - Prometheus API 핸들러
-│   ├── function.go            - 파이프라인 함수 처리 (Python 데몬 통신)
-│   ├── aggregation.go         - PromQL 집계 함수
-│   └── dashboard.go           - Web UI
+│   ├── server.go              - HTTP server
+│   ├── prometheus.go          - Prometheus API handlers
+│   ├── aggregation.go         - PromQL aggregation functions
+│   ├── dashboard.go           - Interactive web UI
+│   └── stats.go               - Statistics tracking
 ├── cmd/
-│   ├── krill-server/          - TSDB 서버
-│   ├── krill-cli/             - CLI 도구
-│   └── krill-scraper/         - Prometheus 스크래퍼
-├── docs/
-│   ├── PYKRILL_DAEMON.md      - Python 데몬 상세 문서 (성능 최적화)
-│   ├── PROMQL_AGGREGATIONS.md - PromQL 집계 함수 가이드
-│   └── KRILL_CLI_GUIDE.md     - CLI 사용 가이드
-└── example/
-    ├── memory_example/        - 메모리 TSDB 예제
-    └── badger_example/        - BadgerDB TSDB 예제
+│   ├── krill-server/          - TSDB server with embedded scraper
+│   ├── krill-cli/             - CLI tool
+│   └── krill-scraper/         - Standalone Prometheus scraper
+├── scraper/                   - Scraper implementation
+│   ├── scraper.go             - Core scraper logic
+│   ├── config.go              - Configuration parsing
+│   └── parser.go              - Prometheus text format parser
+└── docs/
+    ├── HYBRID_ARCHITECTURE.md - Hybrid storage architecture details
+    ├── LABELS_ARCHITECTURE.md - Label indexing and querying
+    ├── STRING_INTERNING.md    - String interning optimization
+    ├── PROMQL_AGGREGATIONS.md - PromQL aggregation functions guide
+    ├── PROMQL_QUICK_REFERENCE.md - Quick reference for PromQL
+    └── KRILL_CLI_GUIDE.md     - CLI usage guide
 ```
 
 ## Technical Details
@@ -240,31 +281,31 @@ Subsequent values:
 - **Iteration**: Prefix scan으로 메트릭별 조회
 - **TTL**: BadgerDB native TTL 사용
 
-## HTTP API Server
+## HTTP API
 
-### Quick Start
+Krill provides a Prometheus-compatible REST API:
 
-서버 빌드 및 실행:
+### Server Options
 
 ```bash
-# Build server
-go build -o krill-server ./cmd/krill-server
+./krill-server [options]
 
-# Run with default settings (port 9090, hybrid storage)
-./krill-server
-
-# Memory-only mode
-./krill-server -memory
-
-# Custom configuration
-./krill-server -addr :8080 -data /var/lib/krill -cache 1h
+Options:
+  -addr string
+        HTTP server address (default ":9090")
+  -data string
+        Persistent storage path (default "./data")
+  -cache duration
+        Memory cache duration (default 1h)
+  -memory
+        Memory-only mode (no persistence)
+  -scrape string
+        Scraper config file (enables embedded scraper)
 ```
 
-### Prometheus-Compatible API
+### 1. Instant Query
 
-Krill은 Prometheus 호환 REST API를 제공합니다:
-
-#### 1. Instant Query
+Query the most recent value of a metric:
 
 ```bash
 curl 'http://localhost:9090/api/v1/query?query=cpu.usage'
@@ -284,11 +325,19 @@ curl 'http://localhost:9090/api/v1/query?query=cpu.usage'
 }
 ```
 
-#### 2. Range Query
+### 2. Range Query
+
+Query time series data over a time range:
 
 ```bash
-curl "http://localhost:9090/api/v1/query_range?query=memory.used&start=1769150810&end=1769154410"
+curl "http://localhost:9090/api/v1/query_range?query=memory.used&start=1769150810&end=1769154410&step=30"
 ```
+
+**Parameters:**
+- `query`: Metric name or PromQL expression
+- `start`: Start timestamp (Unix seconds)
+- `end`: End timestamp (Unix seconds)
+- `step`: Query resolution in seconds (1 = raw data, >1 = downsampled)
 
 **Response:**
 ```json
@@ -308,15 +357,22 @@ curl "http://localhost:9090/api/v1/query_range?query=memory.used&start=176915081
 }
 ```
 
-#### 3. Write Data
+**Step Parameter:**
+- `step=1`: Returns raw data points without resampling
+- `step=30`: Returns data resampled at 30-second intervals
+- Omit `step`: Returns all raw data points (same as `step=1`)
+
+### 3. Write Data
+
+Write a single data point:
 
 ```bash
-# Without tags
+# Simple write
 curl -X POST http://localhost:9090/api/v1/write \
   -H 'Content-Type: application/json' \
   -d '{"metric":"test.metric","value":123.45,"time":1234567890}'
 
-# With tags (Prometheus-style labels)
+# With tags/labels (multi-dimensional metrics)
 curl -X POST http://localhost:9090/api/v1/write \
   -H 'Content-Type: application/json' \
   -d '{
@@ -324,23 +380,30 @@ curl -X POST http://localhost:9090/api/v1/write \
     "value": 75.5,
     "tags": {
       "host": "server1",
-      "env": "prod"
+      "env": "prod",
+      "cpu": "0"
     }
   }'
 ```
 
-#### 3a. Query with Tags
+### 4. Query with Labels
+
+Query metrics with label filters:
 
 ```bash
-# Query all instances of a metric
+# All instances of a metric
 curl 'http://localhost:9090/api/v1/query?query=cpu_usage'
 
-# Query with tag filter (URL encode the query)
-QUERY=$(printf 'cpu_usage{env="prod"}' | jq -sRr @uri)
-curl "http://localhost:9090/api/v1/query?query=$QUERY"
+# Filter by label (Prometheus syntax)
+curl 'http://localhost:9090/api/v1/query?query=cpu_usage{env="prod"}'
+
+# Multiple label filters
+curl 'http://localhost:9090/api/v1/query?query=cpu_usage{env="prod",host="server1"}'
 ```
 
-#### 3b. PromQL Aggregation Functions
+### 5. PromQL Aggregations
+
+Krill supports full Prometheus aggregation operators:
 
 ```bash
 # Sum all CPU usage
@@ -354,17 +417,23 @@ curl 'http://localhost:9090/api/v1/query?query=topk(5,%20cpu_usage)'
 
 # 95th percentile
 curl 'http://localhost:9090/api/v1/query?query=quantile(0.95,%20response_time)'
+
+# Count distinct values
+curl 'http://localhost:9090/api/v1/query?query=count(up)'
 ```
 
-**Supported aggregation functions:**
-- `sum`, `avg`, `min`, `max`, `count`
-- `stddev`, `stdvar`
-- `topk`, `bottomk`
-- `quantile`, `count_values`
+**Supported Aggregation Functions:**
+- **Basic**: `sum`, `avg`, `min`, `max`, `count`
+- **Statistical**: `stddev`, `stdvar`
+- **Ranking**: `topk`, `bottomk`
+- **Distribution**: `quantile`, `count_values`
+- **Grouping**: `by (label1, label2, ...)`
 
-**See [docs/PROMQL_AGGREGATIONS.md](docs/PROMQL_AGGREGATIONS.md) for complete documentation.**
+See [docs/PROMQL_AGGREGATIONS.md](docs/PROMQL_AGGREGATIONS.md) for complete documentation.
 
-#### 4. List Metrics
+### 6. List Metrics
+
+Get all metric names:
 
 ```bash
 curl 'http://localhost:9090/api/v1/label/__name__/values'
@@ -374,131 +443,90 @@ curl 'http://localhost:9090/api/v1/label/__name__/values'
 ```json
 {
   "status": "success",
-  "data": ["cpu.usage", "memory.used", "test.metric"]
+  "data": ["cpu.usage", "memory.used", "node.node_cpu_seconds_total"]
 }
 ```
 
-### Interactive Dashboard
-
-Krill은 웹 기반 대시보드를 제공합니다:
-
-**URL**: `http://localhost:9090/`
-
-**주요 기능**:
-- ✅ **탭 기반 UI**: Read/Write 기능을 탭으로 분리
-- ✅ **Autocomplete**: Metric 입력 시 자동완성 (키보드 네비게이션 지원)
-- ✅ **Instant Query**: 최신 값 조회
-- ✅ **Range Query**: 시간 범위 데이터 + Chart.js 차트
-- ✅ **Tag 지원**: JSON 형식으로 tag 입력 가능
-- ✅ **실시간 통계**: 총 메트릭 수, 쿼리/쓰기 횟수
-
-**Read 탭**:
-- Metric name 입력 (autocomplete 지원)
-- Query type 선택 (instant/range)
-- 시간 범위 설정 (range query)
-- JSON 결과 및 시각화 차트
-
-**Write 탭**:
-- Metric name 입력 (autocomplete 지원)
-- Value 입력
-- Tags 입력 (JSON 형식, 예: `{"host":"web1","env":"prod"}`)
-- Timestamp (선택적)
-
-**Autocomplete 사용법**:
-- 메트릭 이름 입력 시 자동으로 드롭다운 표시
-- 화살표 키(↑↓)로 선택, Enter로 확정
-- ESC로 닫기
-
-#### 5. Health Check
+### 7. Health Check
 
 ```bash
 curl http://localhost:9090/health
 # Response: OK
 ```
 
-### Server Options
+## Embedded Scraper (Recommended)
 
-- `-addr`: HTTP 서버 주소 (기본값: `:9090`)
-- `-data`: 영구 저장소 경로 (기본값: `/tmp/krill-data`)
-- `-cache`: 메모리 캐시 기간 (기본값: `2h`)
-- `-memory`: 메모리 전용 모드
+Krill includes a high-performance embedded scraper that writes directly to the TSDB, bypassing HTTP/JSON overhead.
 
-### Test API
+### Performance Benefits
 
-API 테스트 스크립트 실행:
+**Embedded Scraper** (Direct Memory Writes):
+- 📈 **137,000+ points/sec**
+- ⚡ Zero HTTP/JSON serialization overhead
+- ⚡ Direct memory writes to TSDB
+- ⚡ Single process (easier to manage)
 
-```bash
-./test_api.sh
-```
+**Traditional HTTP Scraper**:
+- 📉 ~10,000 points/sec
+- 🐌 HTTP round-trip + JSON encoding/decoding
+- 🐌 Network latency
+- 🐌 Separate processes
 
-## Metrics Scraper
+**Result: 10x+ performance improvement!**
 
-Krill scraper는 Prometheus 호환 exporter들로부터 메트릭을 수집하여 Krill server로 전송합니다.
+### Configuration
 
-### Architecture
-
-```
-Prometheus Exporter → Scraper → HTTP API → Krill Server → TSDB
-```
-
-### Scraper 실행
-
-```bash
-# 1. Start Krill server first
-./krill-server
-
-# 2. Build scraper
-go build -o krill-scraper ./cmd/krill-scraper
-
-# 3. Run scraper
-./krill-scraper -config scraper.yaml -server http://localhost:9090
-
-# Connect to remote server
-./krill-scraper -config scraper.yaml -server http://krill.example.com:9090
-
-# Custom statistics interval
-./krill-scraper -config scraper.yaml -stats 30s
-```
-
-### Configuration (scraper.yaml)
+Create a `scraper.yaml` file:
 
 ```yaml
 global:
-  scrape_interval: 15s  # 기본 수집 주기
-  scrape_timeout: 10s   # 타임아웃
+  scrape_interval: 15s  # Default scrape interval
+  scrape_timeout: 10s   # Timeout
 
 scrape_configs:
   - job_name: 'node-exporter'
     scrape_interval: 30s
     metrics_path: '/metrics'
-    metric_prefix: 'node'  # 메트릭 이름 앞에 추가
+    metric_prefix: 'node'  # Prefix added to metric names
     labels:
-      cluster: 'prod'      # 모든 메트릭에 추가할 레이블
+      cluster: 'prod'      # Labels added to all metrics
     static_configs:
       - targets:
           - 'localhost:9100'
         labels:
           environment: 'production'
+          
+  - job_name: 'prometheus'
+    scrape_interval: 15s
+    metrics_path: '/metrics'
+    metric_prefix: 'prometheus'
+    static_configs:
+      - targets:
+          - 'localhost:9090'
 ```
 
-### Demo
-
-Mock exporter와 Krill server를 함께 실행하는 데모:
+### Running with Embedded Scraper
 
 ```bash
-./demo_scraper.sh
+# Start server with embedded scraper
+./krill-server --scrape=scraper.yaml
+
+# You'll see output like:
+# ✓ Embedded scraper enabled - Direct TSDB writes (10x+ faster than HTTP)
+# Scraped localhost:9100: wrote 984 metrics directly to TSDB (embedded)
+# [ASYNC-WRITE] Completed batch #1: 984 points in 7.14ms (137727 pts/sec)
 ```
 
 ### Features
 
-- ✅ **Prometheus 호환**: 표준 Prometheus 메트릭 포맷 지원
-- ✅ **Tag/Label 지원**: 메트릭 레이블을 그대로 Krill에 전송 (다차원 시계열)
-- ✅ **HTTP API 전송**: Krill server의 /api/v1/write 엔드포인트로 전송
-- ✅ **자동 수집**: 설정된 주기마다 자동으로 메트릭 수집
-- ✅ **병렬 처리**: 여러 타겟 동시 scrape
-- ✅ **레이블 관리**: job, instance, custom labels 자동 추가
-- ✅ **통계**: 수집 성공률, 메트릭 수 등 실시간 통계
-- ✅ **원격 서버**: 중앙 집중식 Krill server로 메트릭 전송
+- ✅ **Direct TSDB writes**: No HTTP/JSON overhead
+- ✅ **Prometheus compatible**: Standard Prometheus metrics format
+- ✅ **Multi-dimensional labels**: Full tag/label support
+- ✅ **Automatic scheduling**: Configurable scrape intervals per job
+- ✅ **Parallel scraping**: Multiple targets scraped concurrently
+- ✅ **Label management**: Automatic job, instance, and custom labels
+- ✅ **Error handling**: Continues scraping on individual target failures
+- ✅ **Statistics**: Real-time scrape success rate and metrics count
 
 ### Supported Exporters
 
@@ -506,4 +534,84 @@ Mock exporter와 Krill server를 함께 실행하는 데모:
 - Prometheus (self-monitoring)
 - Custom application exporters
 - Any Prometheus-compatible exporter
+
+## Standalone Scraper (Optional)
+
+For distributed setups, you can run a standalone scraper that sends data via HTTP:
+
+```bash
+# Build scraper
+cd cmd/krill-scraper
+go build
+
+# Run scraper pointing to remote Krill server
+./krill-scraper -config scraper.yaml -server http://krill.example.com:9090
+```
+
+## Technical Details
+
+### Gorilla Compression Algorithm
+
+#### Timestamp Compression (Delta-of-Delta)
+```
+First timestamp: Stored as-is (64 bits)
+First delta: 14 bits
+Subsequent deltas:
+  - Same as previous: 1 bit
+  - ±63: 2 bits + 7 bits data
+  - ±255: 3 bits + 9 bits data
+  - ±2047: 4 bits + 12 bits data
+  - Other: 4 bits + 32 bits data
+```
+
+#### Value Compression (XOR)
+```
+First value: Stored as-is (64 bits)
+Subsequent values:
+  - Same as previous: 1 bit
+  - Different:
+    - Control bit: 1 bit
+    - Leading zeros: 5 bits
+    - Significant bits length: 6 bits
+    - Significant bits: variable
+```
+
+### Hybrid Storage Architecture
+
+**Memory Cache (Hot Data)**:
+- Recent data (default: 1 hour)
+- Gorilla compression
+- Ultra-fast queries (3M+ reads/sec)
+- Automatic eviction to disk
+
+**BadgerDB (Cold Data)**:
+- Historical data (configurable retention)
+- LSM-tree storage with compression
+- Time-based partitioning (3600s buckets)
+- Efficient range queries
+
+**Inverted Index**:
+- Label-based posting lists
+- Fast label matching
+- Memory-efficient with string interning
+- Persistent across restarts
+
+See [docs/HYBRID_ARCHITECTURE.md](docs/HYBRID_ARCHITECTURE.md) and [docs/LABELS_ARCHITECTURE.md](docs/LABELS_ARCHITECTURE.md) for more details.
+
+## License
+
+MIT License
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Documentation
+
+- [Hybrid Architecture](docs/HYBRID_ARCHITECTURE.md) - Detailed architecture of hybrid storage
+- [Labels Architecture](docs/LABELS_ARCHITECTURE.md) - Label indexing and query optimization
+- [String Interning](docs/STRING_INTERNING.md) - Memory optimization techniques
+- [PromQL Aggregations](docs/PROMQL_AGGREGATIONS.md) - Complete PromQL aggregation guide
+- [PromQL Quick Reference](docs/PROMQL_QUICK_REFERENCE.md) - Quick PromQL syntax reference
+- [CLI Guide](docs/KRILL_CLI_GUIDE.md) - Command-line interface documentation
 
