@@ -19,15 +19,10 @@ import (
 // Config represents the YAML configuration file
 type Config struct {
 	Storage struct {
-		Type           string `yaml:"type"`
 		BucketDuration string `yaml:"bucket_duration"`
 	} `yaml:"storage"`
 	
-	Badger struct {
-		Path       string `yaml:"path"`
-		Partitions int    `yaml:"partitions"`
-		ChunkSize  int    `yaml:"chunk_size"`
-	} `yaml:"badger"`
+	Sampling []SamplingLevel `yaml:"sampling"`
 	
 	Logging struct {
 		Level          string `yaml:"level"`
@@ -40,6 +35,106 @@ type Config struct {
 	} `yaml:"logging"`
 }
 
+type SamplingLevel struct {
+	Name      string        `yaml:"name"`
+	Interval  string        `yaml:"interval"`
+	Retention string        `yaml:"retention"`
+	Storage   StorageConfig `yaml:"storage"`
+}
+
+type StorageConfig struct {
+	Type          string        `yaml:"type"`
+	Badger        *BadgerConfig `yaml:"badger,omitempty"`
+	ClickHouse    *ClickHouseConfig `yaml:"clickhouse,omitempty"`
+}
+
+type BadgerConfig struct {
+	Path       string `yaml:"path"`
+	Partitions int    `yaml:"partitions"`
+	ChunkSize  int    `yaml:"chunk_size"`
+}
+
+type ClickHouseConfig struct {
+	Host      string `yaml:"host"`
+	Database  string `yaml:"database"`
+	Table     string `yaml:"table"`
+	User      string `yaml:"user"`
+	Password  string `yaml:"password"`
+	BatchSize int    `yaml:"batch_size"`
+}
+
+func validateConfig(config *Config) error {
+	if len(config.Sampling) == 0 {
+		return fmt.Errorf("sampling configuration is empty")
+	}
+	
+	// Check level 0 (raw) is mandatory
+	if config.Sampling[0].Name != "raw" {
+		return fmt.Errorf("level 0 must be 'raw' (mandatory)")
+	}
+	
+	rawInterval, err := parseFlexibleDuration(config.Sampling[0].Interval)
+	if err != nil || rawInterval != 0 {
+		return fmt.Errorf("level 0 'raw' must have interval: 0s")
+	}
+	
+	// Check for duplicate intervals
+	intervals := make(map[string]bool)
+	for _, level := range config.Sampling {
+		if intervals[level.Interval] {
+			return fmt.Errorf("duplicate sampling interval found: %s", level.Interval)
+		}
+		intervals[level.Interval] = true
+		
+		// Validate storage type
+		if level.Storage.Type != "badger" {
+			return fmt.Errorf("unsupported storage type '%s' for level '%s' (only 'badger' is currently supported)", 
+				level.Storage.Type, level.Name)
+		}
+		
+		// Validate badger config exists
+		if level.Storage.Badger == nil {
+			return fmt.Errorf("badger configuration is required for level '%s'", level.Name)
+		}
+	}
+	
+	return nil
+}
+
+func parseFlexibleDuration(input string) (time.Duration, error) {
+	if input == "" {
+		return 0, fmt.Errorf("duration is empty")
+	}
+
+	if d, err := time.ParseDuration(input); err == nil {
+		return d, nil
+	}
+
+	// Support suffixes: d (day), w (week), y (year)
+	unit := input[len(input)-1]
+	value := input[:len(input)-1]
+
+	var multiplier time.Duration
+	switch unit {
+	case 'd':
+		multiplier = 24 * time.Hour
+	case 'w':
+		multiplier = 7 * 24 * time.Hour
+	case 'y':
+		multiplier = 365 * 24 * time.Hour
+	default:
+		return 0, fmt.Errorf("unsupported duration unit: %q", string(unit))
+	}
+
+	var n int64
+	_, err := fmt.Sscanf(value, "%d", &n)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration value: %s", input)
+	}
+
+	return time.Duration(n) * multiplier, nil
+}
+
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -50,6 +145,11 @@ func loadConfig(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
+	
+	// Validate configuration
+	if err := validateConfig(&config); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
 
 	return &config, nil
 }
@@ -58,7 +158,6 @@ func main() {
 	// Command-line flags
 	configFile := flag.String("config", "", "Path to config YAML file (default: ./conf.yaml in executable directory)")
 	addr := flag.String("addr", ":9090", "HTTP server listen address")
-	retention := flag.Duration("retention", 30*24*time.Hour, "Data retention period (e.g., 7d, 15d, 30d). Default: 30d")
 	scrapeConfig := flag.String("scrape", "", "Path to scraper config YAML file (enables embedded scraping for 10x+ performance)")
 	printQuery := flag.Bool("printQuery", false, "Print all incoming HTTP requests for debugging")
 	debugIndex := flag.Bool("debugIndex", false, "Enable debug logging for index operations")
@@ -106,11 +205,6 @@ func main() {
 	}
 	log.Printf("Loaded config from %s", configPath)
 
-	// Validate storage type
-	if config.Storage.Type != "badger" {
-		log.Fatalf("Unsupported storage type: %s (only 'badger' is currently supported)", config.Storage.Type)
-	}
-
 	// Apply logging config
 	if config.Logging.LogToStderr {
 		flag.Set("logtostderr", "true")
@@ -140,29 +234,38 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Starting Krill TSDB Server...")
 
-	// Create TSDB instance using config values
-	dataDir := config.Badger.Path
-	partitions := config.Badger.Partitions
-	chunkSize := config.Badger.ChunkSize
+	// Get level 0 (raw) configuration
+	rawLevel := config.Sampling[0]
+	dataDir := rawLevel.Storage.Badger.Path
+	partitions := rawLevel.Storage.Badger.Partitions
+	chunkSize := rawLevel.Storage.Badger.ChunkSize
 	
 	// Parse bucket duration from config
-	bucketSize, err := time.ParseDuration(config.Storage.BucketDuration)
+	bucketSize, err := parseFlexibleDuration(config.Storage.BucketDuration)
 	if err != nil {
 		log.Fatalf("Invalid bucket_duration in config: %v", err)
 	}
 	
-	bucketSizeSeconds := int64(bucketSize.Seconds())
-	if *retention > 0 {
-		log.Printf("Using hybrid storage (bucket: %v, retention: %v, data: %s, partitions: %d, chunk: %d)", 
-			bucketSize, *retention, dataDir, partitions, chunkSize)
-	} else {
-		log.Printf("Using hybrid storage (bucket: %v, no retention, data: %s, partitions: %d, chunk: %d)", 
-			bucketSize, dataDir, partitions, chunkSize)
+	// Parse retention for raw level
+	retention, err := parseFlexibleDuration(rawLevel.Retention)
+	if err != nil {
+		log.Fatalf("Invalid retention in raw level: %v", err)
 	}
+	
+	// Create TSDB instance for level 0 (raw)
+	log.Printf("Configuring level 0 'raw': path=%s, partitions=%d, chunk=%d", 
+		dataDir, partitions, chunkSize)
+	
+	bucketSizeSeconds := int64(bucketSize.Seconds())
+	cacheDuration := bucketSize // level 0 cache always equals bucket_duration
+	
+	log.Printf("Using hybrid storage (bucket: %v, retention: %v, data: %s, partitions: %d, chunk: %d, cache: %v)", 
+		bucketSize, retention, dataDir, partitions, chunkSize, cacheDuration)
+	
 	tsdb, err := krill.NewHybridTSDB(krill.HybridOptions{
 		PersistencePath: dataDir,
-		CacheDuration:   bucketSize, // Memory cache keeps 1 bucket only
-		TTL:             *retention,
+		CacheDuration:   cacheDuration,
+		TTL:             retention,
 		DebugIndex:      *debugIndex,
 		ChunkSize:       chunkSize,
 		Partitions:      partitions,
@@ -175,6 +278,55 @@ func main() {
 		log.Println("Closing TSDB...")
 		tsdb.Close()
 	}()
+	
+	// Log downsampling levels
+	log.Printf("Configured %d sampling levels:", len(config.Sampling))
+	for i, level := range config.Sampling {
+		log.Printf("  Level %d: name=%s, interval=%s, retention=%s, type=%s, path=%s",
+			i, level.Name, level.Interval, level.Retention, 
+			level.Storage.Type, level.Storage.Badger.Path)
+	}
+	log.Println("Note: Downsampling aggregates: [avg, min, max, count]")
+	
+	// Create downsampling manager and configure levels
+	dsManager := krill.NewDownsamplingManager(tsdb)
+	
+	// Add downsampling levels (skip level 0 which is raw)
+	for i := 1; i < len(config.Sampling); i++ {
+		level := config.Sampling[i]
+		
+		// Parse interval and retention
+		interval, err := parseFlexibleDuration(level.Interval)
+		if err != nil {
+			log.Fatalf("Invalid interval for level '%s': %v", level.Name, err)
+		}
+		
+		retention, err := parseFlexibleDuration(level.Retention)
+		if err != nil {
+			log.Fatalf("Invalid retention for level '%s': %v", level.Name, err)
+		}
+		
+		// Create storage for this level
+		dsStorage, err := krill.CreateDownsamplingStorage(
+			level.Storage.Badger.Path,
+			level.Storage.Badger.Partitions,
+			level.Storage.Badger.ChunkSize,
+			bucketSizeSeconds,
+			retention,
+		)
+		if err != nil {
+			log.Fatalf("Failed to create storage for level '%s': %v", level.Name, err)
+		}
+		
+		// Add level to manager
+		if err := dsManager.AddLevel(level.Name, interval, retention, dsStorage); err != nil {
+			log.Fatalf("Failed to add downsampling level '%s': %v", level.Name, err)
+		}
+	}
+	
+	// Start downsampling
+	dsManager.Start()
+	defer dsManager.Stop()
 
 	// Start embedded scraper if config provided
 	var embeddedScraper *krill.EmbeddedScraper

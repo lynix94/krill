@@ -3,10 +3,10 @@
 
 global:
   # Default scrape interval for all jobs
-  scrape_interval: 15s
+  scrape_interval: 5s
   
   # Default timeout for scrape requests
-  scrape_timeout: 10s
+  scrape_timeout: 3s
 
 # Scrape job configurations
 scrape_configs:

@@ -138,6 +138,11 @@ func (h *HybridTSDB) TsdbPut(ts int64, metric string, value float64) error {
 		return fmt.Errorf("failed to write to persistent storage: %w", err)
 	}
 
+	// Invalidate metrics cache when new data is added
+	h.mu.Lock()
+	h.metricsCache = nil
+	h.mu.Unlock()
+
 	return nil
 }
 
@@ -147,6 +152,11 @@ func (h *HybridTSDB) TsdbPutBatch(points []storage.DataPoint) error {
 	if err := h.memoryCache.PutBatch(points); err != nil {
 		return fmt.Errorf("failed to write batch to memory cache: %w", err)
 	}
+
+	// Invalidate metrics cache when new data is added
+	h.mu.Lock()
+	h.metricsCache = nil
+	h.mu.Unlock()
 
 	// Write to persistent storage
 	if h.asyncWrites {

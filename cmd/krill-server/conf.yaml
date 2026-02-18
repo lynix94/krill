@@ -2,41 +2,53 @@
 
 # Database Configuration
 storage:
-  # Storage backend type: badger, clickhouse, hybrid
-  # badger is available now
-  type: badger
   bucket_duration: 1h
 
-badger:
-  # Path to data directory
-  path: ./data
-
-  # Number of partitions for parallel writes
-  # Recommended: 2-8 (current: 8 achieves 170k OPS)
-  partitions: 8
-  
-  # Batch size for writes (number of data points per batch)
-  chunk_size: 10000
-
 sampling:
-  # raw level is mandatory
-  - name: "raw"                # Raw data (no downsampling)
+  # Level 0: Raw data (mandatory)
+  # Direct memory block to storage (high performance)
+  - name: "raw"
     interval: 0s              # No aggregation, keep original data
     retention: 2d             # Keep raw data for 2 days
-    storage_key: ":raw"       # Redis key prefix for raw data
+    storage:
+      type: "badger"
+      badger:
+        path: "./data/raw"
+        partitions: 8         # High parallelism for raw writes
+        chunk_size: 10000
 
-  # Level 1: 1 min resolution (keep for 30 days)
+  # Level 1: 1-minute downsampling
   - name: "1m_summary"
-    interval: 1m              # Aggregate every 1 day
+    interval: 1m              # Aggregate every 1 minute
     retention: 30d            # Keep for 30 days
-    storage_key: ":downsampled_1m"
+    storage:
+      type: "badger"
+      badger:
+        path: "./data/ds_1m"
+        partitions: 4         # Medium parallelism
+        chunk_size: 10000
   
-  # Level 2: 1-hour resolution (keep for 1 year)
+  # Level 2: 1-hour downsampling
   - name: "1h_summary"
     interval: 1h              # Aggregate every 1 hour
     retention: 3y             # Keep for 3 years
-    storage_key: ":downsampled_1h"
-  
+    storage:
+      type: "badger"
+      badger:
+        path: "./data/ds_1h"
+        partitions: 2         # Low parallelism for long-term data
+        chunk_size: 10000
+      
+      # Example: Switch to ClickHouse for long-term storage
+      # type: "clickhouse"
+      # clickhouse:
+      #   host: "localhost:9000"
+      #   database: "tsdb"
+      #   table: "metrics_1h"
+      #   user: "default"
+      #   password: ""
+      #   batch_size: 10000
+
 
 # Logging Configuration
 logging:
