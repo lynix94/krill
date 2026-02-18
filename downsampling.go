@@ -131,17 +131,27 @@ func (dm *DownsamplingManager) downsample(level *DownsamplingLevel) error {
 	
 	log.Printf("Downsampling '%s': processing range %v to %v", level.Name, startTime, endTime)
 	
-	// Get all metrics from raw storage
-	metrics, err := dm.rawStorage.GetMetrics()
+	// Get metrics from memory cache if available (raw metrics only)
+	// If memoryCache is not available, fall back to rawStorage
+	var metrics []string
+	var err error
+	
+	if dm.memoryCache != nil {
+		metrics, err = dm.memoryCache.GetMetrics()
+	} else {
+		metrics, err = dm.rawStorage.GetMetrics()
+	}
+	
 	if err != nil {
 		return fmt.Errorf("failed to get metrics: %w", err)
 	}
 	if len(metrics) == 0 {
-		log.Printf("No metrics found in raw storage for downsampling '%s'", level.Name)
+		log.Printf("No metrics found for downsampling '%s'", level.Name)
 		return nil
 	}
 	
 	// Filter out already downsampled metrics (those with _avg, _min, _max, _count suffixes)
+	// This is critical to prevent exponential growth
 	rawMetrics := make([]string, 0, len(metrics))
 	for _, metric := range metrics {
 		if !strings.HasSuffix(metric, "_avg") && 
@@ -153,6 +163,12 @@ func (dm *DownsamplingManager) downsample(level *DownsamplingLevel) error {
 	}
 	
 	log.Printf("Downsampling '%s': processing %d raw metrics (filtered from %d total)", level.Name, len(rawMetrics), len(metrics))
+	
+	// Early exit if no raw metrics (all filtered out)
+	if len(rawMetrics) == 0 {
+		log.Printf("Downsampling '%s': no raw metrics to process (all filtered)", level.Name)
+		return nil
+	}
 	metrics = nil // Release memory
 	
 	// Process in batches to limit memory usage

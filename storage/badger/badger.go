@@ -119,6 +119,11 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 	badgerOpts.ValueLogFileSize = 256 << 20 // 256MB value log files (fewer rotations)
 	badgerOpts.MemTableSize = 128 << 20     // 128MB memtable (fewer flushes, better batching)
 	badgerOpts.BlockCacheSize = 256 << 20   // 256MB block cache (more read cache)
+	
+	// Note: BadgerDB v4 always uses mmap for SST files and manages memory automatically
+	// TableLoadingMode and ValueLogLoadingMode are not available in v4
+	badgerOpts.BaseTableSize = 2 << 20               // 2MB base table size (smaller files)
+	badgerOpts.BaseLevelSize = 10 << 20              // 10MB base level size
 
 	db, err := badger.Open(badgerOpts)
 	if err != nil {
@@ -1223,13 +1228,34 @@ func (bdb *BadgerTSDB) runBackgroundGC() {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
+	log.Printf("Background GC started (interval: 1h, threshold: 50%%)")
+
 	for range ticker.C {
+		// Get size before GC
+		lsmBefore, vlogBefore := bdb.db.Size()
+		log.Printf("Background GC starting: LSM=%.2f MB, VLog=%.2f MB, Total=%.2f MB",
+			float64(lsmBefore)/(1024*1024),
+			float64(vlogBefore)/(1024*1024),
+			float64(lsmBefore+vlogBefore)/(1024*1024))
+
 		// Run value log GC to reclaim disk space from deleted/expired entries
 		err := bdb.db.RunValueLogGC(0.5)
-		if err != nil && err != badger.ErrNoRewrite {
-			log.Printf("Background GC error: %v", err)
-		} else if err == nil {
-			log.Printf("Background GC completed successfully")
+		
+		// Get size after GC
+		_, vlogAfter := bdb.db.Size()
+		savedSpace := (vlogBefore - vlogAfter)
+		
+		if err != nil {
+			if err == badger.ErrNoRewrite {
+				log.Printf("Background GC: no rewrite needed (all vlog files have < 50%% garbage)")
+			} else {
+				log.Printf("Background GC error: %v", err)
+			}
+		} else {
+			log.Printf("Background GC completed: saved %.2f MB (VLog: %.2f → %.2f MB)",
+				float64(savedSpace)/(1024*1024),
+				float64(vlogBefore)/(1024*1024),
+				float64(vlogAfter)/(1024*1024))
 		}
 	}
 }

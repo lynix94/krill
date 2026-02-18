@@ -210,6 +210,33 @@ func main() {
 		flag.Set("logtostderr", "true")
 	} else {
 		flag.Set("logtostderr", "false")
+		
+		// If logging to file, set up log file
+		if config.Logging.LogDir != "" {
+			// Create log directory if not exists
+			if err := os.MkdirAll(config.Logging.LogDir, 0755); err != nil {
+				log.Fatalf("Failed to create log directory: %v", err)
+			}
+			
+			// Create log file with timestamp
+			logFileName := filepath.Join(config.Logging.LogDir, 
+				fmt.Sprintf("krill-server-%s.log", time.Now().Format("20060102-150405")))
+			logFile, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+			if err != nil {
+				log.Fatalf("Failed to open log file: %v", err)
+			}
+			
+			// Redirect log output to file
+			log.SetOutput(logFile)
+			log.Printf("Logging to file: %s", logFileName)
+			
+			// Create symlink to latest log
+			latestLink := filepath.Join(config.Logging.LogDir, "krill-server-latest.log")
+			os.Remove(latestLink) // Remove old symlink if exists
+			if err := os.Symlink(filepath.Base(logFileName), latestLink); err != nil {
+				log.Printf("Warning: Failed to create symlink: %v", err)
+			}
+		}
 	}
 	
 	if config.Logging.LogDir != "" {

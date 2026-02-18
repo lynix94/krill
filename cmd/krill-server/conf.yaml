@@ -59,10 +59,10 @@ logging:
   format: text
   
   # Log to standard error instead of files
-  logtostderr: true
+  logtostderr: false
   
   # Log file directory (empty = disabled, only used if logtostderr=false)
-  log_dir: ""
+  log_dir: "./logs"
   
   # Enable stack trace at specific file:line (e.g., "server.go:123")
   log_backtrace_at: ""
