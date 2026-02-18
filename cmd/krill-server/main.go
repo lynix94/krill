@@ -18,6 +18,17 @@ import (
 
 // Config represents the YAML configuration file
 type Config struct {
+	Storage struct {
+		Type           string `yaml:"type"`
+		BucketDuration string `yaml:"bucket_duration"`
+	} `yaml:"storage"`
+	
+	Badger struct {
+		Path       string `yaml:"path"`
+		Partitions int    `yaml:"partitions"`
+		ChunkSize  int    `yaml:"chunk_size"`
+	} `yaml:"badger"`
+	
 	Logging struct {
 		Level          string `yaml:"level"`
 		Format         string `yaml:"format"`
@@ -47,14 +58,10 @@ func main() {
 	// Command-line flags
 	configFile := flag.String("config", "", "Path to config YAML file (default: ./conf.yaml in executable directory)")
 	addr := flag.String("addr", ":9090", "HTTP server listen address")
-	dataDir := flag.String("data", "/tmp/krill-data", "Data directory for persistent storage")
-	bucketSize := flag.Duration("bucketSize", 2*time.Hour, "Bucket size (e.g., 2h, 1h, 30m). Memory cache keeps 1 bucket only.")
 	retention := flag.Duration("retention", 30*24*time.Hour, "Data retention period (e.g., 7d, 15d, 30d). Default: 30d")
 	scrapeConfig := flag.String("scrape", "", "Path to scraper config YAML file (enables embedded scraping for 10x+ performance)")
 	printQuery := flag.Bool("printQuery", false, "Print all incoming HTTP requests for debugging")
 	debugIndex := flag.Bool("debugIndex", false, "Enable debug logging for index operations")
-	chunkSize := flag.Int("chunkSize", 10000, "BadgerDB batch chunk size (default: 10000, larger = faster writes but more memory)")
-	partitions := flag.Int("partitions", 4, "Number of BadgerDB partitions for parallel writes (default: 4, 0 = disabled)")
 	
 	// Custom usage function to hide glog flags
 	glogFlags := map[string]bool{
@@ -92,56 +99,73 @@ func main() {
 		}
 	}
 
-	// Apply logging config from YAML
-	if config, err := loadConfig(configPath); err == nil {
-		log.Printf("Loaded config from %s", configPath)
-		
-		// Set glog flags programmatically
-		if config.Logging.LogToStderr {
-			flag.Set("logtostderr", "true")
-		} else {
-			flag.Set("logtostderr", "false")
-		}
-		
-		if config.Logging.LogDir != "" {
-			flag.Set("log_dir", config.Logging.LogDir)
-		}
-		
-		if config.Logging.LogBacktraceAt != "" {
-			flag.Set("log_backtrace_at", config.Logging.LogBacktraceAt)
-		}
-		
-		if config.Logging.LogBufLevel >= -1 {
-			flag.Set("logbuflevel", string(rune(config.Logging.LogBufLevel+'0')))
-		}
-		
-		if config.Logging.LogLink != "" {
-			flag.Set("log_link", config.Logging.LogLink)
-		}
-		
-		log.Printf("Applied logging config: level=%s, format=%s, logtostderr=%v", 
-			config.Logging.Level, config.Logging.Format, config.Logging.LogToStderr)
-	} else {
-		log.Printf("No config file found at %s, using defaults", configPath)
+	// Load configuration
+	config, err := loadConfig(configPath)
+	if err != nil {
+		log.Fatalf("Failed to load config from %s: %v", configPath, err)
 	}
+	log.Printf("Loaded config from %s", configPath)
+
+	// Validate storage type
+	if config.Storage.Type != "badger" {
+		log.Fatalf("Unsupported storage type: %s (only 'badger' is currently supported)", config.Storage.Type)
+	}
+
+	// Apply logging config
+	if config.Logging.LogToStderr {
+		flag.Set("logtostderr", "true")
+	} else {
+		flag.Set("logtostderr", "false")
+	}
+	
+	if config.Logging.LogDir != "" {
+		flag.Set("log_dir", config.Logging.LogDir)
+	}
+	
+	if config.Logging.LogBacktraceAt != "" {
+		flag.Set("log_backtrace_at", config.Logging.LogBacktraceAt)
+	}
+	
+	if config.Logging.LogBufLevel >= -1 {
+		flag.Set("logbuflevel", string(rune(config.Logging.LogBufLevel+'0')))
+	}
+	
+	if config.Logging.LogLink != "" {
+		flag.Set("log_link", config.Logging.LogLink)
+	}
+	
+	log.Printf("Applied logging config: level=%s, format=%s, logtostderr=%v", 
+		config.Logging.Level, config.Logging.Format, config.Logging.LogToStderr)
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Starting Krill TSDB Server...")
 
-	// Create TSDB instance
+	// Create TSDB instance using config values
+	dataDir := config.Badger.Path
+	partitions := config.Badger.Partitions
+	chunkSize := config.Badger.ChunkSize
+	
+	// Parse bucket duration from config
+	bucketSize, err := time.ParseDuration(config.Storage.BucketDuration)
+	if err != nil {
+		log.Fatalf("Invalid bucket_duration in config: %v", err)
+	}
+	
 	bucketSizeSeconds := int64(bucketSize.Seconds())
 	if *retention > 0 {
-		log.Printf("Using hybrid storage (bucket: %v, retention: %v, data: %s)", *bucketSize, *retention, *dataDir)
+		log.Printf("Using hybrid storage (bucket: %v, retention: %v, data: %s, partitions: %d, chunk: %d)", 
+			bucketSize, *retention, dataDir, partitions, chunkSize)
 	} else {
-		log.Printf("Using hybrid storage (bucket: %v, no retention, data: %s)", *bucketSize, *dataDir)
+		log.Printf("Using hybrid storage (bucket: %v, no retention, data: %s, partitions: %d, chunk: %d)", 
+			bucketSize, dataDir, partitions, chunkSize)
 	}
 	tsdb, err := krill.NewHybridTSDB(krill.HybridOptions{
-		PersistencePath: *dataDir,
-		CacheDuration:   *bucketSize, // Memory cache keeps 1 bucket only
+		PersistencePath: dataDir,
+		CacheDuration:   bucketSize, // Memory cache keeps 1 bucket only
 		TTL:             *retention,
 		DebugIndex:      *debugIndex,
-		ChunkSize:       *chunkSize,
-		Partitions:      *partitions,
+		ChunkSize:       chunkSize,
+		Partitions:      partitions,
 		BucketSize:      bucketSizeSeconds,
 	})
 	if err != nil {

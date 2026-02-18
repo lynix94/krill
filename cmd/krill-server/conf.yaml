@@ -1,0 +1,62 @@
+# Krill TSDB Configuration
+
+# Database Configuration
+storage:
+  # Storage backend type: badger, clickhouse, hybrid
+  # badger is available now
+  type: badger
+  bucket_duration: 1h
+
+badger:
+  # Path to data directory
+  path: ./data
+
+  # Number of partitions for parallel writes
+  # Recommended: 2-8 (current: 8 achieves 170k OPS)
+  partitions: 8
+  
+  # Batch size for writes (number of data points per batch)
+  chunk_size: 10000
+
+sampling:
+  # raw level is mandatory
+  - name: "raw"                # Raw data (no downsampling)
+    interval: 0s              # No aggregation, keep original data
+    retention: 2d             # Keep raw data for 2 days
+    storage_key: ":raw"       # Redis key prefix for raw data
+
+  # Level 1: 1 min resolution (keep for 30 days)
+  - name: "1m_summary"
+    interval: 1m              # Aggregate every 1 day
+    retention: 30d            # Keep for 30 days
+    storage_key: ":downsampled_1m"
+  
+  # Level 2: 1-hour resolution (keep for 1 year)
+  - name: "1h_summary"
+    interval: 1h              # Aggregate every 1 hour
+    retention: 3y             # Keep for 3 years
+    storage_key: ":downsampled_1h"
+  
+
+# Logging Configuration
+logging:
+  # Log level: debug, info, warn, error
+  level: info
+  
+  # Log format: json, text
+  format: text
+  
+  # Log to standard error instead of files
+  logtostderr: true
+  
+  # Log file directory (empty = disabled, only used if logtostderr=false)
+  log_dir: ""
+  
+  # Enable stack trace at specific file:line (e.g., "server.go:123")
+  log_backtrace_at: ""
+  
+  # Buffer log messages at this level or lower (-1=no buffer, 0=INFO only)
+  logbuflevel: -1
+  
+  # Create symbolic links to log files in this directory
+  log_link: ""
