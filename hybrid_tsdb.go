@@ -126,6 +126,24 @@ func NewHybridTSDB(opts HybridOptions) (*HybridTSDB, error) {
 	return h, nil
 }
 
+// GetMemoryCache returns the memory cache for direct access (used by downsampling)
+func (h *HybridTSDB) GetMemoryCache() QueryableDB {
+	return &memoryCacheWrapper{h.memoryCache}
+}
+
+// memoryCacheWrapper wraps MemoryStorage to implement QueryableDB interface
+type memoryCacheWrapper struct {
+	*memory.MemoryStorage
+}
+
+func (w *memoryCacheWrapper) TsdbPut(ts int64, metric string, value float64) error {
+	return w.Put(ts, metric, value)
+}
+
+func (w *memoryCacheWrapper) TsdbPutBatch(points []storage.DataPoint) error {
+	return w.PutBatch(points)
+}
+
 // TsdbPut stores a data point in both memory cache and persistent storage
 func (h *HybridTSDB) TsdbPut(ts int64, metric string, value float64) error {
 	// Write to memory cache first (fast path)
@@ -701,6 +719,13 @@ func (h *HybridTSDB) asyncWriterLoop() {
 		select {
 		case points := <-h.writeQueue:
 			batch = append(batch, points...)
+			
+			// Monitor queue depth
+			queueLen := len(h.writeQueue)
+			if queueLen > cap(h.writeQueue)/2 {
+				fmt.Printf("[WARN] Write queue is filling up: %d/%d (%.1f%% full)\n", 
+					queueLen, cap(h.writeQueue), float64(queueLen)/float64(cap(h.writeQueue))*100)
+			}
 
 			// Flush immediately if batch is large enough
 			if len(batch) >= 10000 {

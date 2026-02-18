@@ -289,7 +289,10 @@ func main() {
 	log.Println("Note: Downsampling aggregates: [avg, min, max, count]")
 	
 	// Create downsampling manager and configure levels
-	dsManager := krill.NewDownsamplingManager(tsdb)
+	// Pass memory cache for fast reads (avoids BadgerDB disk I/O)
+	memCache := tsdb.GetMemoryCache()
+	log.Println("Downsampling will use memory cache for fast data reads")
+	dsManager := krill.NewDownsamplingManager(tsdb, memCache)
 	
 	// Add downsampling levels (skip level 0 which is raw)
 	for i := 1; i < len(config.Sampling); i++ {

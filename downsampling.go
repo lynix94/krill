@@ -3,6 +3,7 @@ package krill
 import (
 	"fmt"
 	"log"
+	"strings"
 	"math"
 	"sort"
 	"sync"
@@ -23,10 +24,11 @@ type DownsamplingLevel struct {
 
 // DownsamplingManager manages multiple downsampling levels
 type DownsamplingManager struct {
-	rawStorage QueryableDB
-	levels     []*DownsamplingLevel
-	stopCh     chan struct{}
-	wg         sync.WaitGroup
+	rawStorage   QueryableDB
+	memoryCache  QueryableDB // Direct access to memory cache for fast reads
+	levels       []*DownsamplingLevel
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
 }
 
 // AggregatedData holds downsampled metrics
@@ -38,11 +40,13 @@ type AggregatedData struct {
 }
 
 // NewDownsamplingManager creates a new downsampling manager
-func NewDownsamplingManager(rawStorage QueryableDB) *DownsamplingManager {
+// If memoryCache is provided, it will be used for fast data reads instead of disk
+func NewDownsamplingManager(rawStorage QueryableDB, memoryCache QueryableDB) *DownsamplingManager {
 	return &DownsamplingManager{
-		rawStorage: rawStorage,
-		levels:     make([]*DownsamplingLevel, 0),
-		stopCh:     make(chan struct{}),
+		rawStorage:  rawStorage,
+		memoryCache: memoryCache,
+		levels:      make([]*DownsamplingLevel, 0),
+		stopCh:      make(chan struct{}),
 	}
 }
 
@@ -137,26 +141,71 @@ func (dm *DownsamplingManager) downsample(level *DownsamplingLevel) error {
 		return nil
 	}
 	
-	log.Printf("Downsampling '%s': processing %d metrics", level.Name, len(metrics))
-	
-	// Process each metric
-	processedCount := 0
+	// Filter out already downsampled metrics (those with _avg, _min, _max, _count suffixes)
+	rawMetrics := make([]string, 0, len(metrics))
 	for _, metric := range metrics {
-		if err := dm.downsampleMetric(level, metric, startTime, endTime); err != nil {
-			log.Printf("Error downsampling metric '%s' for level '%s': %v", metric, level.Name, err)
-			continue
+		if !strings.HasSuffix(metric, "_avg") && 
+		   !strings.HasSuffix(metric, "_min") && 
+		   !strings.HasSuffix(metric, "_max") && 
+		   !strings.HasSuffix(metric, "_count") {
+			rawMetrics = append(rawMetrics, metric)
 		}
-		processedCount++
 	}
 	
-	log.Printf("Downsampling '%s': completed %d/%d metrics", level.Name, processedCount, len(metrics))
+	log.Printf("Downsampling '%s': processing %d raw metrics (filtered from %d total)", level.Name, len(rawMetrics), len(metrics))
+	metrics = nil // Release memory
+	
+	// Process in batches to limit memory usage
+	processedCount := 0
+	skippedCount := 0
+	batchSize := 1000
+	
+	for i := 0; i < len(rawMetrics); i += batchSize {
+		end := i + batchSize
+		if end > len(rawMetrics) {
+			end = len(rawMetrics)
+		}
+		batch := rawMetrics[i:end]
+		
+		for _, metric := range batch {
+			if err := dm.downsampleMetric(level, metric, startTime, endTime); err != nil {
+				// Only log non-"not found" errors to reduce noise
+				if err.Error() != "metric not found" && !strings.Contains(err.Error(), "metric not found") {
+					log.Printf("Error downsampling metric '%s' for level '%s': %v", metric, level.Name, err)
+				}
+				skippedCount++
+				continue
+			}
+			processedCount++
+		}
+		
+		// Log progress for large datasets
+		if len(rawMetrics) > 10000 && (end%10000 == 0 || end == len(rawMetrics)) {
+			log.Printf("Downsampling '%s': progress %d/%d metrics", level.Name, end, len(rawMetrics))
+		}
+	}
+	
+	if skippedCount > 0 {
+		log.Printf("Downsampling '%s': completed %d/%d metrics (skipped %d)", level.Name, processedCount, len(metrics), skippedCount)
+	} else {
+		log.Printf("Downsampling '%s': completed %d/%d metrics", level.Name, processedCount, len(metrics))
+	}
 	return nil
 }
 
 // downsampleMetric downsamples a single metric
 func (dm *DownsamplingManager) downsampleMetric(level *DownsamplingLevel, metric string, startTime, endTime time.Time) error {
-	// Get raw data points
-	timestamps, values, err := dm.rawStorage.Get(metric, startTime.Unix(), endTime.Unix())
+	// Get raw data points from memory cache first (much faster than disk)
+	var timestamps []int64
+	var values []float64
+	var err error
+	
+	if dm.memoryCache != nil {
+		timestamps, values, err = dm.memoryCache.Get(metric, startTime.Unix(), endTime.Unix())
+	} else {
+		timestamps, values, err = dm.rawStorage.Get(metric, startTime.Unix(), endTime.Unix())
+	}
+	
 	if err != nil {
 		return fmt.Errorf("failed to get raw data: %w", err)
 	}
@@ -167,6 +216,10 @@ func (dm *DownsamplingManager) downsampleMetric(level *DownsamplingLevel, metric
 	
 	// Aggregate data by interval
 	buckets := dm.aggregateByInterval(timestamps, values, level.Interval)
+	
+	// Release memory immediately after aggregation
+	timestamps = nil
+	values = nil
 	
 	// Store aggregated data in ascending time order
 	bucketTimes := make([]int64, 0, len(buckets))
