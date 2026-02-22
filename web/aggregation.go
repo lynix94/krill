@@ -71,8 +71,51 @@ func parsePromQL(query string) ParsedQuery {
 		AggSumOverTime, AggAvgOverTime, AggMinOverTime, AggMaxOverTime,
 		AggCountOverTime, AggStddevOverTime, AggStdvarOverTime, AggQuantileOverTime,
 	} {
-		prefix := string(aggFunc) + "("
-		if strings.HasPrefix(query, prefix) {
+		funcName := string(aggFunc)
+		
+		// Check for "func by (...) (...)" pattern (e.g., "sum by (operation) (rate(...))")
+		byPrefix := funcName + " by ("
+		normalPrefix := funcName + "("
+		
+		var innerQuery string
+		var foundMatch bool
+		
+		if strings.HasPrefix(query, byPrefix) {
+			// Extract the by clause: "sum by (operation) (rate(...))"
+			remaining := query[len(funcName)+4:] // Skip "sum by "
+			// Find closing paren for by clause
+			depth := 0
+			byEndIdx := -1
+			for i := 0; i < len(remaining); i++ {
+				if remaining[i] == '(' {
+					depth++
+				} else if remaining[i] == ')' {
+					depth--
+					if depth == 0 {
+						byEndIdx = i
+						break
+					}
+				}
+			}
+			
+			if byEndIdx > 0 {
+				// Extract group by labels from (labels)
+				groupByStr := remaining[1:byEndIdx] // Skip first '(' and get content
+				labels := strings.Split(groupByStr, ",")
+				for _, label := range labels {
+					parsed.GroupBy = append(parsed.GroupBy, strings.TrimSpace(label))
+				}
+				
+				// Now parse the actual function argument
+				funcArg := strings.TrimSpace(remaining[byEndIdx+1:])
+				if strings.HasPrefix(funcArg, "(") && strings.HasSuffix(funcArg, ")") {
+					innerQuery = funcArg[1 : len(funcArg)-1]
+					parsed.AggFunc = aggFunc
+					foundMatch = true
+				}
+			}
+		} else if strings.HasPrefix(query, normalPrefix) {
+			// Normal function call: "sum(rate(...))"
 			parsed.AggFunc = aggFunc
 			
 			// Find matching closing parenthesis
@@ -91,74 +134,9 @@ func parsePromQL(query string) ParsedQuery {
 			}
 
 			if endIdx > 0 {
-				innerQuery := query[len(prefix):endIdx]
+				innerQuery = query[len(normalPrefix):endIdx]
+				foundMatch = true
 				
-				// Handle functions with parameters (topk, bottomk, quantile, count_values)
-				if aggFunc == AggTopk || aggFunc == AggBottomk || aggFunc == AggQuantile {
-					// Format: topk(5, metric) or quantile(0.95, metric)
-					parts := strings.SplitN(innerQuery, ",", 2)
-					if len(parts) == 2 {
-						param, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-						if err == nil {
-							parsed.AggParam = param
-							innerQuery = strings.TrimSpace(parts[1])
-						}
-					}
-				} else if aggFunc == AggCountValues {
-					// Format: count_values("value", metric)
-					parts := strings.SplitN(innerQuery, ",", 2)
-					if len(parts) == 2 {
-						parsed.AggParamLabel = strings.Trim(strings.TrimSpace(parts[0]), "\"")
-						innerQuery = strings.TrimSpace(parts[1])
-					}
-				} else if aggFunc == AggQuantileOverTime {
-					// Format: quantile_over_time(0.95, metric[5m])
-					parts := strings.SplitN(innerQuery, ",", 2)
-					if len(parts) == 2 {
-						param, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
-						if err == nil {
-							parsed.AggParam = param
-							innerQuery = strings.TrimSpace(parts[1])
-						}
-					}
-				}
-
-				// Check if innerQuery is another function (e.g., sum(rate(...)))
-				// Range vector functions: rate, irate, *_over_time
-				rangeVectorFuncs := []string{"rate(", "irate(", "sum_over_time(", "avg_over_time(", 
-					"min_over_time(", "max_over_time(", "count_over_time(", 
-					"stddev_over_time(", "stdvar_over_time(", "quantile_over_time("}
-				isNestedFunction := false
-				for _, rvFunc := range rangeVectorFuncs {
-					if strings.HasPrefix(innerQuery, rvFunc) {
-						// Recursively parse the inner query
-						innerParsed := parsePromQL(innerQuery)
-						parsed.InnerQuery = &innerParsed
-						// Copy metric and label info from inner query
-						parsed.MetricName = innerParsed.MetricName
-						parsed.LabelMatchers = innerParsed.LabelMatchers
-						parsed.RangeVector = innerParsed.RangeVector
-						isNestedFunction = true
-						break
-					}
-				}
-
-				if !isNestedFunction {
-					// Parse range vector selector [5m], [1h], etc.
-					if strings.Contains(innerQuery, "[") {
-						rangeStart := strings.Index(innerQuery, "[")
-						rangeEnd := strings.Index(innerQuery, "]")
-						if rangeStart > 0 && rangeEnd > rangeStart {
-							rangeStr := innerQuery[rangeStart+1 : rangeEnd]
-							parsed.RangeVector = parseDuration(rangeStr)
-							innerQuery = innerQuery[:rangeStart] // Remove range selector from query
-						}
-					}
-
-					// Parse the inner metric query
-					parsed.MetricName, parsed.LabelMatchers = parseMetricKey(innerQuery)
-				}
-
 				// Check for "by" clause after the closing parenthesis
 				remaining := strings.TrimSpace(query[endIdx+1:])
 				if strings.HasPrefix(remaining, "by") {
@@ -173,6 +151,75 @@ func parsePromQL(query string) ParsedQuery {
 					}
 				}
 			}
+		}
+		
+		if foundMatch {
+			// Handle functions with parameters (topk, bottomk, quantile, count_values)
+			if aggFunc == AggTopk || aggFunc == AggBottomk || aggFunc == AggQuantile {
+				// Format: topk(5, metric) or quantile(0.95, metric)
+				parts := strings.SplitN(innerQuery, ",", 2)
+				if len(parts) == 2 {
+					param, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+					if err == nil {
+						parsed.AggParam = param
+						innerQuery = strings.TrimSpace(parts[1])
+					}
+				}
+			} else if aggFunc == AggCountValues {
+				// Format: count_values("value", metric)
+				parts := strings.SplitN(innerQuery, ",", 2)
+				if len(parts) == 2 {
+					parsed.AggParamLabel = strings.Trim(strings.TrimSpace(parts[0]), "\"")
+					innerQuery = strings.TrimSpace(parts[1])
+				}
+			} else if aggFunc == AggQuantileOverTime {
+				// Format: quantile_over_time(0.95, metric[5m])
+				parts := strings.SplitN(innerQuery, ",", 2)
+				if len(parts) == 2 {
+					param, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+					if err == nil {
+						parsed.AggParam = param
+						innerQuery = strings.TrimSpace(parts[1])
+					}
+				}
+			}
+
+			// Check if innerQuery is another function (e.g., sum(rate(...)))
+			// Range vector functions: rate, irate, *_over_time
+			rangeVectorFuncs := []string{"rate(", "irate(", "sum_over_time(", "avg_over_time(", 
+				"min_over_time(", "max_over_time(", "count_over_time(", 
+				"stddev_over_time(", "stdvar_over_time(", "quantile_over_time("}
+			isNestedFunction := false
+			for _, rvFunc := range rangeVectorFuncs {
+				if strings.HasPrefix(innerQuery, rvFunc) {
+					// Recursively parse the inner query
+					innerParsed := parsePromQL(innerQuery)
+					parsed.InnerQuery = &innerParsed
+					// Copy metric and label info from inner query
+					parsed.MetricName = innerParsed.MetricName
+					parsed.LabelMatchers = innerParsed.LabelMatchers
+					parsed.RangeVector = innerParsed.RangeVector
+					isNestedFunction = true
+					break
+				}
+			}
+
+			if !isNestedFunction {
+				// Parse range vector selector [5m], [1h], etc.
+				if strings.Contains(innerQuery, "[") {
+					rangeStart := strings.Index(innerQuery, "[")
+					rangeEnd := strings.Index(innerQuery, "]")
+					if rangeStart > 0 && rangeEnd > rangeStart {
+						rangeStr := innerQuery[rangeStart+1 : rangeEnd]
+						parsed.RangeVector = parseDuration(rangeStr)
+						innerQuery = innerQuery[:rangeStart] // Remove range selector from query
+					}
+				}
+
+				// Parse the inner metric query
+				parsed.MetricName, parsed.LabelMatchers = parseMetricKey(innerQuery)
+			}
+			
 			return parsed
 		}
 	}
