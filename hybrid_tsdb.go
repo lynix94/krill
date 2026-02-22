@@ -2,6 +2,7 @@ package krill
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -197,7 +198,7 @@ func (h *HybridTSDB) TsdbPutBatch(points []storage.DataPoint) error {
 		default:
 			// Queue full - log warning but don't block
 			// Data is still safe in memory cache
-			fmt.Printf("[WARN] Write queue full, skipping disk write\n")
+			log.Printf("[WARN] Write queue full, skipping disk write\n")
 		}
 		return nil
 	} else {
@@ -700,15 +701,15 @@ func (h *HybridTSDB) asyncWriterLoop() {
 
 		startTime := time.Now()
 		pointCount := len(batch)
-		fmt.Printf("[ASYNC-WRITE] Starting flush of %d points...\n", pointCount)
+		log.Printf("[ASYNC-WRITE] Starting flush of %d points...\n", pointCount)
 		
 		if err := h.persistStorage.PutBatch(batch); err != nil {
-			fmt.Printf("[ERROR] Failed to flush batch (%d points): %v\n", pointCount, err)
+			log.Printf("[ERROR] Failed to flush batch (%d points): %v\n", pointCount, err)
 		} else {
 			batchCount++
 			totalFlushed += int64(pointCount)
 			elapsed := time.Since(startTime)
-			fmt.Printf("[ASYNC-WRITE] Completed batch #%d: %d points in %v (%.0f pts/sec, total: %d)\n",
+			log.Printf("[ASYNC-WRITE] Completed batch #%d: %d points in %v (%.0f pts/sec, total: %d)\n",
 				batchCount, pointCount, elapsed, float64(pointCount)/elapsed.Seconds(), totalFlushed)
 		}
 
@@ -723,7 +724,7 @@ func (h *HybridTSDB) asyncWriterLoop() {
 			// Monitor queue depth
 			queueLen := len(h.writeQueue)
 			if queueLen > cap(h.writeQueue)/2 {
-				fmt.Printf("[WARN] Write queue is filling up: %d/%d (%.1f%% full)\n", 
+				log.Printf("[WARN] Write queue is filling up: %d/%d (%.1f%% full)\n", 
 					queueLen, cap(h.writeQueue), float64(queueLen)/float64(cap(h.writeQueue))*100)
 			}
 
@@ -751,7 +752,7 @@ func (h *HybridTSDB) asyncWriterLoop() {
 			}
 		done:
 			flushBatch()
-			fmt.Printf("[INFO] Async writer stopped (total flushed: %d points)\n", totalFlushed)
+			log.Printf("[INFO] Async writer stopped (total flushed: %d points)\n", totalFlushed)
 			return
 		}
 	}

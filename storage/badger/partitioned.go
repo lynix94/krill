@@ -2,6 +2,7 @@ package badger
 
 import (
 	"fmt"
+	"log"
 	"path/filepath"
 	"sync"
 
@@ -20,6 +21,7 @@ func NewPartitionedBadgerTSDB(opts BadgerOptions, numPartitions int) (*Partition
 		numPartitions = 4 // Default
 	}
 
+	log.Printf("[PartitionedBadgerTSDB] Creating %d partitions at %s", numPartitions, opts.Path)
 	partitions := make([]*BadgerTSDB, numPartitions)
 	
 	// Create each partition with separate directory
@@ -27,6 +29,7 @@ func NewPartitionedBadgerTSDB(opts BadgerOptions, numPartitions int) (*Partition
 		partitionOpts := opts
 		partitionOpts.Path = filepath.Join(opts.Path, fmt.Sprintf("partition_%d", i))
 		
+		log.Printf("[PartitionedBadgerTSDB] Creating partition %d/%d at %s", i+1, numPartitions, partitionOpts.Path)
 		partition, err := NewBadgerTSDB(partitionOpts)
 		if err != nil {
 			// Cleanup already created partitions on error
@@ -36,8 +39,10 @@ func NewPartitionedBadgerTSDB(opts BadgerOptions, numPartitions int) (*Partition
 			return nil, fmt.Errorf("failed to create partition %d: %w", i, err)
 		}
 		partitions[i] = partition
+		log.Printf("[PartitionedBadgerTSDB] Partition %d/%d created successfully", i+1, numPartitions)
 	}
 
+	log.Printf("[PartitionedBadgerTSDB] All %d partitions created successfully", numPartitions)
 	return &PartitionedBadgerTSDB{
 		partitions:   partitions,
 		numPartitions: numPartitions,

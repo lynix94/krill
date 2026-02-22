@@ -72,16 +72,19 @@ func (dm *DownsamplingManager) AddLevel(name string, interval, retention time.Du
 // Start begins the downsampling process
 func (dm *DownsamplingManager) Start() {
 	if len(dm.levels) == 0 {
-		log.Println("No downsampling levels configured, skipping downsampling")
+		log.Println("[DownsamplingManager] No downsampling levels configured, skipping downsampling")
 		return
 	}
 	
-	log.Printf("Starting downsampling manager with %d levels", len(dm.levels))
+	log.Printf("[DownsamplingManager] Starting downsampling manager with %d levels", len(dm.levels))
 	
-	for _, level := range dm.levels {
+	for i, level := range dm.levels {
+		log.Printf("[DownsamplingManager] Starting goroutine for level %d: %s", i+1, level.Name)
 		dm.wg.Add(1)
 		go dm.runLevel(level)
 	}
+	
+	log.Printf("[DownsamplingManager] All %d downsampling goroutines started", len(dm.levels))
 }
 
 // Stop stops the downsampling process

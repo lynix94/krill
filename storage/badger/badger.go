@@ -15,11 +15,13 @@ import (
 	"github.com/dgraph-io/badger/v4"
 	"github.com/lynix/krill/storage"
 	"github.com/lynix/krill/storage/gorilla"
+	bolt "go.etcd.io/bbolt"
 )
 
 // BadgerTSDB is a persistent time-series database using BadgerDB
 type BadgerTSDB struct {
 	db               *badger.DB
+	indexDB          *bolt.DB                      // BoltDB for inverted index
 	ttl              time.Duration
 	labels           map[uint64]storage.Labels // seriesID -> labels mapping
 	labelsMu         sync.RWMutex              // Protects labels map
@@ -31,6 +33,7 @@ type BadgerTSDB struct {
 
 	// Inverted index: labelName -> labelValue -> []seriesID
 	// Example: labelIndex["cpu"]["cpu0"] = [seriesID1, seriesID3, ...]
+	// Stored in memory for fast queries, persisted to BoltDB
 	labelIndex   map[string]map[string][]uint64
 	labelIndexMu sync.RWMutex
 
@@ -125,6 +128,7 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 	badgerOpts.BaseTableSize = 2 << 20               // 2MB base table size (smaller files)
 	badgerOpts.BaseLevelSize = 10 << 20              // 10MB base level size
 
+	log.Printf("[BadgerDB] Opening BadgerDB at: %s", opts.Path)
 	db, err := badger.Open(badgerOpts)
 	if err != nil {
 		// If normal open fails, try with BypassLockGuard (allows recovery on locked DB)
@@ -138,9 +142,38 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 		}
 		log.Printf("Successfully opened BadgerDB with recovery options. Database may need compaction.")
 	}
+	log.Printf("[BadgerDB] BadgerDB opened successfully")
+
+	// Open BoltDB for inverted index (stored in same directory as BadgerDB)
+	indexPath := opts.Path + "/index.db"
+	log.Printf("[BoltDB] Opening BoltDB index at: %s", indexPath)
+	indexDB, err := bolt.Open(indexPath, 0600, &bolt.Options{
+		Timeout:      1 * time.Second,
+		NoGrowSync:   false,
+		FreelistType: bolt.FreelistArrayType,
+	})
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to open BoltDB for index: %w", err)
+	}
+	log.Printf("[BoltDB] BoltDB opened successfully")
+
+	// Create index bucket if not exists
+	log.Printf("[BoltDB] Creating index bucket if not exists...")
+	err = indexDB.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte("idx"))
+		return err
+	})
+	if err != nil {
+		db.Close()
+		indexDB.Close()
+		return nil, fmt.Errorf("failed to create index bucket: %w", err)
+	}
+	log.Printf("[BoltDB] Index bucket ready")
 
 	bdb := &BadgerTSDB{
 		db:               db,
+		indexDB:          indexDB,
 		ttl:              opts.TTL,
 		labels:           make(map[uint64]storage.Labels),
 		formattedMetrics: make(map[uint64]string),
@@ -166,6 +199,7 @@ func NewBadgerTSDB(opts BadgerOptions) (*BadgerTSDB, error) {
 	// Load all series labels from database
 	if err := bdb.loadAllSeries(); err != nil {
 		db.Close()
+		indexDB.Close()
 		return nil, fmt.Errorf("failed to load series: %w", err)
 	}
 
@@ -775,63 +809,63 @@ func (bdb *BadgerTSDB) GetAllSeries() ([]storage.Labels, error) {
 }
 
 // updateLabelIndex updates the inverted index when a new series is added
-// Persists to disk immediately for consistency
+// Persists to BoltDB immediately for consistency
 func (bdb *BadgerTSDB) updateLabelIndex(seriesID uint64, labels storage.Labels) {
 	bdb.labelIndexMu.Lock()
 	defer bdb.labelIndexMu.Unlock()
 
-	// Batch all index updates for this series
-	wb := bdb.db.NewWriteBatch()
-	defer wb.Cancel()
-
-	for _, label := range labels {
-		// Create label name map if not exists
-		if bdb.labelIndex[label.Name] == nil {
-			bdb.labelIndex[label.Name] = make(map[string][]uint64)
+	// Update memory index and persist to BoltDB
+	err := bdb.indexDB.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("idx"))
+		if bucket == nil {
+			return fmt.Errorf("index bucket not found")
 		}
 
-		// Add seriesID to posting list
-		posting := bdb.labelIndex[label.Name][label.Value]
-		// Check if already exists
-		alreadyExists := false
-		for _, id := range posting {
-			if id == seriesID {
-				alreadyExists = true
-				break
+		for _, label := range labels {
+			// Create label name map if not exists
+			if bdb.labelIndex[label.Name] == nil {
+				bdb.labelIndex[label.Name] = make(map[string][]uint64)
+			}
+
+			// Add seriesID to posting list
+			posting := bdb.labelIndex[label.Name][label.Value]
+			// Check if already exists
+			alreadyExists := false
+			for _, id := range posting {
+				if id == seriesID {
+					alreadyExists = true
+					break
+				}
+			}
+
+			if !alreadyExists {
+				bdb.labelIndex[label.Name][label.Value] = append(posting, seriesID)
+
+				// Persist this posting list to BoltDB
+				key := []byte(label.Name + ":" + label.Value)
+				buf := make([]byte, len(bdb.labelIndex[label.Name][label.Value])*8)
+				for i, id := range bdb.labelIndex[label.Name][label.Value] {
+					binary.BigEndian.PutUint64(buf[i*8:], id)
+				}
+
+				if err := bucket.Put(key, buf); err != nil {
+					return err
+				}
 			}
 		}
+		return nil
+	})
 
-		if !alreadyExists {
-			bdb.labelIndex[label.Name][label.Value] = append(posting, seriesID)
-
-			// Persist this posting list to disk
-			key := fmt.Sprintf("idx:%s:%s", label.Name, label.Value)
-			buf := make([]byte, len(bdb.labelIndex[label.Name][label.Value])*8)
-			for i, id := range bdb.labelIndex[label.Name][label.Value] {
-				binary.BigEndian.PutUint64(buf[i*8:], id)
-			}
-
-			if err := wb.Set([]byte(key), buf); err != nil {
-				log.Printf("[BADGER-INDEX] Warning: failed to add index entry to batch: %v", err)
-			}
-		}
-	}
-
-	// Flush all index updates for this series
-	if err := wb.Flush(); err != nil {
-		log.Printf("[BADGER-INDEX] Warning: failed to persist index updates: %v", err)
+	if err != nil {
+		log.Printf("[BOLTDB-INDEX] Warning: failed to persist index updates: %v", err)
 	}
 }
 
 // updateLabelIndexBatch updates the inverted index for multiple series in one transaction
-// More efficient and avoids WriteBatch conflicts
+// More efficient for batch operations
 func (bdb *BadgerTSDB) updateLabelIndexBatch(newSeries map[uint64]storage.Labels) {
 	bdb.labelIndexMu.Lock()
 	defer bdb.labelIndexMu.Unlock()
-
-	// Single WriteBatch for all series
-	wb := bdb.db.NewWriteBatch()
-	defer wb.Cancel()
 
 	// Track which posting lists need to be persisted
 	updatedPostings := make(map[string]bool)
@@ -857,34 +891,41 @@ func (bdb *BadgerTSDB) updateLabelIndexBatch(newSeries map[uint64]storage.Labels
 			if !alreadyExists {
 				bdb.labelIndex[label.Name][label.Value] = append(posting, seriesID)
 				// Mark this posting list as updated
-				updatedPostings[fmt.Sprintf("%s:%s", label.Name, label.Value)] = true
+				updatedPostings[label.Name+":"+label.Value] = true
 			}
 		}
 	}
 
-	// Persist all updated posting lists
-	for postingKey := range updatedPostings {
-		parts := strings.SplitN(postingKey, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		labelName, labelValue := parts[0], parts[1]
-
-		key := fmt.Sprintf("idx:%s:%s", labelName, labelValue)
-		seriesIDs := bdb.labelIndex[labelName][labelValue]
-		buf := make([]byte, len(seriesIDs)*8)
-		for i, id := range seriesIDs {
-			binary.BigEndian.PutUint64(buf[i*8:], id)
+	// Persist all updated posting lists to BoltDB in single transaction
+	err := bdb.indexDB.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("idx"))
+		if bucket == nil {
+			return fmt.Errorf("index bucket not found")
 		}
 
-		if err := wb.Set([]byte(key), buf); err != nil {
-			log.Printf("[BADGER-INDEX] Warning: failed to add index entry to batch: %v", err)
-		}
-	}
+		for postingKey := range updatedPostings {
+			parts := strings.SplitN(postingKey, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			labelName, labelValue := parts[0], parts[1]
 
-	// Single flush for all updates
-	if err := wb.Flush(); err != nil {
-		log.Printf("[BADGER-INDEX] Warning: failed to persist index updates: %v", err)
+			key := []byte(postingKey)
+			seriesIDs := bdb.labelIndex[labelName][labelValue]
+			buf := make([]byte, len(seriesIDs)*8)
+			for i, id := range seriesIDs {
+				binary.BigEndian.PutUint64(buf[i*8:], id)
+			}
+
+			if err := bucket.Put(key, buf); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		log.Printf("[BOLTDB-INDEX] Warning: failed to persist index updates: %v", err)
 	}
 }
 
@@ -907,114 +948,97 @@ func (bdb *BadgerTSDB) updateLabelIndexBulk(seriesID uint64, labels storage.Labe
 	}
 }
 
-// saveIndexEntryToDB persists a single posting list to BadgerDB (deprecated)
-func (bdb *BadgerTSDB) saveIndexEntryToDB(labelName, labelValue string, seriesIDs []uint64) {
-	key := fmt.Sprintf("idx:%s:%s", labelName, labelValue)
-
-	// Serialize seriesIDs
-	buf := make([]byte, len(seriesIDs)*8)
-	for i, id := range seriesIDs {
-		binary.BigEndian.PutUint64(buf[i*8:], id)
-	}
-
-	err := bdb.db.Update(func(txn *badger.Txn) error {
-		return txn.Set([]byte(key), buf)
-	})
-
-	if err != nil {
-		log.Printf("[BADGER-INDEX] Warning: failed to persist index entry %s=%s: %v", labelName, labelValue, err)
-	}
-}
-
-// persistEntireIndex saves the entire inverted index to BadgerDB in batches
+// persistEntireIndex saves the entire inverted index to BoltDB
 func (bdb *BadgerTSDB) persistEntireIndex() error {
 	bdb.labelIndexMu.RLock()
 	defer bdb.labelIndexMu.RUnlock()
 
-	wb := bdb.db.NewWriteBatch()
-	defer wb.Cancel()
+	log.Printf("[BOLTDB-INDEX] Persisting %d label names to disk...", len(bdb.labelIndex))
 
-	count := 0
-	for labelName, valueMap := range bdb.labelIndex {
-		for labelValue, seriesIDs := range valueMap {
-			key := fmt.Sprintf("idx:%s:%s", labelName, labelValue)
-			buf := make([]byte, len(seriesIDs)*8)
-			for i, id := range seriesIDs {
-				binary.BigEndian.PutUint64(buf[i*8:], id)
-			}
+	err := bdb.indexDB.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("idx"))
+		if bucket == nil {
+			return fmt.Errorf("index bucket not found")
+		}
 
-			if err := wb.Set([]byte(key), buf); err != nil {
-				return err
-			}
+		count := 0
+		for labelName, valueMap := range bdb.labelIndex {
+			for labelValue, seriesIDs := range valueMap {
+				key := []byte(labelName + ":" + labelValue)
+				buf := make([]byte, len(seriesIDs)*8)
+				for i, id := range seriesIDs {
+					binary.BigEndian.PutUint64(buf[i*8:], id)
+				}
 
-			count++
-			if count%10000 == 0 {
-				if err := wb.Flush(); err != nil {
+				if err := bucket.Put(key, buf); err != nil {
 					return err
 				}
-				wb = bdb.db.NewWriteBatch()
+
+				count++
+				if count%10000 == 0 {
+					log.Printf("[BOLTDB-INDEX] Progress: %d posting lists persisted", count)
+				}
 			}
 		}
-	}
 
-	return wb.Flush()
+		log.Printf("[BOLTDB-INDEX] Persisted %d posting lists", count)
+		return nil
+	})
+
+	return err
 }
 
-// loadIndexFromDB loads the entire inverted index from BadgerDB
+// loadIndexFromDB loads the entire inverted index from BoltDB
 func (bdb *BadgerTSDB) loadIndexFromDB() error {
-	log.Printf("[BADGER-INDEX] Loading inverted index from disk...")
+	log.Printf("[BOLTDB-INDEX] Loading inverted index from disk...")
 
 	bdb.labelIndexMu.Lock()
 	defer bdb.labelIndexMu.Unlock()
 
 	bdb.labelIndex = make(map[string]map[string][]uint64)
 
-	err := bdb.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = []byte("idx:")
-		it := txn.NewIterator(opts)
-		defer it.Close()
+	err := bdb.indexDB.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("idx"))
+		if bucket == nil {
+			return fmt.Errorf("index bucket not found")
+		}
 
 		count := 0
-		for it.Rewind(); it.Valid(); it.Next() {
-			item := it.Item()
-			key := string(item.Key())
+		c := bucket.Cursor()
 
-			// Parse key: "idx:labelName:labelValue"
-			parts := strings.SplitN(key, ":", 3)
-			if len(parts) != 3 {
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			// Parse key: "labelName:labelValue"
+			parts := strings.SplitN(string(k), ":", 2)
+			if len(parts) != 2 {
 				continue
 			}
-			labelName := parts[1]
-			labelValue := parts[2]
+			labelName := parts[0]
+			labelValue := parts[1]
 
 			// Deserialize seriesIDs
-			err := item.Value(func(val []byte) error {
-				if len(val)%8 != 0 {
-					return fmt.Errorf("invalid posting list size")
-				}
+			if len(v)%8 != 0 {
+				log.Printf("[BOLTDB-INDEX] Warning: invalid posting list size for %s=%s", labelName, labelValue)
+				continue
+			}
 
-				seriesIDs := make([]uint64, len(val)/8)
-				for i := 0; i < len(seriesIDs); i++ {
-					seriesIDs[i] = binary.BigEndian.Uint64(val[i*8:])
-				}
+			seriesIDs := make([]uint64, len(v)/8)
+			for i := 0; i < len(seriesIDs); i++ {
+				seriesIDs[i] = binary.BigEndian.Uint64(v[i*8:])
+			}
 
-				// Add to index
-				if bdb.labelIndex[labelName] == nil {
-					bdb.labelIndex[labelName] = make(map[string][]uint64)
-				}
-				bdb.labelIndex[labelName][labelValue] = seriesIDs
-				count++
+			// Add to index
+			if bdb.labelIndex[labelName] == nil {
+				bdb.labelIndex[labelName] = make(map[string][]uint64)
+			}
+			bdb.labelIndex[labelName][labelValue] = seriesIDs
+			count++
 
-				return nil
-			})
-
-			if err != nil {
-				log.Printf("[BADGER-INDEX] Warning: failed to load index entry %s=%s: %v", labelName, labelValue, err)
+			if count%10000 == 0 {
+				log.Printf("[BOLTDB-INDEX] Progress: %d posting lists loaded", count)
 			}
 		}
 
-		log.Printf("[BADGER-INDEX] Loaded %d posting lists from disk", count)
+		log.Printf("[BOLTDB-INDEX] Loaded %d posting lists from disk", count)
 		return nil
 	})
 
@@ -1032,8 +1056,8 @@ func (bdb *BadgerTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uin
 	defer bdb.labelIndexMu.RUnlock()
 
 	if bdb.debugIndex {
-		log.Printf("[BADGER-INDEX] Searching with matchers: %v", labelMatchers)
-		log.Printf("[BADGER-INDEX] Index has %d label names", len(bdb.labelIndex))
+		log.Printf("[BOLTDB-INDEX] Searching with matchers: %v", labelMatchers)
+		log.Printf("[BOLTDB-INDEX] Index has %d label names", len(bdb.labelIndex))
 	}
 
 	// Find the smallest posting list to start with (optimization)
@@ -1043,7 +1067,7 @@ func (bdb *BadgerTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uin
 	for labelName, labelValue := range labelMatchers {
 		if valueMap, ok := bdb.labelIndex[labelName]; ok {
 			if bdb.debugIndex {
-				log.Printf("[BADGER-INDEX] Label %q has %d values", labelName, len(valueMap))
+				log.Printf("[BOLTDB-INDEX] Label %q has %d values", labelName, len(valueMap))
 				
 				// Debug: print all available values for this label
 				if labelName == "__name__" {
@@ -1051,13 +1075,13 @@ func (bdb *BadgerTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uin
 					for v := range valueMap {
 						availableValues = append(availableValues, v)
 					}
-					log.Printf("[BADGER-INDEX] Available values for __name__: %v", availableValues)
+					log.Printf("[BOLTDB-INDEX] Available values for __name__: %v", availableValues)
 				}
 			}
 			
 			if posting, ok := valueMap[labelValue]; ok {
 				if bdb.debugIndex {
-					log.Printf("[BADGER-INDEX] Label %q=%q has %d series", labelName, labelValue, len(posting))
+					log.Printf("[BOLTDB-INDEX] Label %q=%q has %d series", labelName, labelValue, len(posting))
 				}
 				if smallestSize == -1 || len(posting) < smallestSize {
 					smallestPosting = posting
@@ -1066,15 +1090,15 @@ func (bdb *BadgerTSDB) FindSeriesByLabels(labelMatchers map[string]string) []uin
 			} else {
 				// Label value not found - no matches
 				if bdb.debugIndex {
-					log.Printf("[BADGER-INDEX] Label value %q not found for label %q", labelValue, labelName)
-					log.Printf("[BADGER-INDEX] Searched for (len=%d, bytes=%v)", len(labelValue), []byte(labelValue))
+					log.Printf("[BOLTDB-INDEX] Label value %q not found for label %q", labelValue, labelName)
+					log.Printf("[BOLTDB-INDEX] Searched for (len=%d, bytes=%v)", len(labelValue), []byte(labelValue))
 				}
 				return nil
 			}
 		} else {
 			// Label name not found - no matches
 			if bdb.debugIndex {
-				log.Printf("[BADGER-INDEX] Label name %q not found in index", labelName)
+				log.Printf("[BOLTDB-INDEX] Label name %q not found in index", labelName)
 			}
 			return nil
 		}
@@ -1215,6 +1239,11 @@ func (bdb *BadgerTSDB) GetMetricCount() int {
 
 // Close closes the database
 func (bdb *BadgerTSDB) Close() error {
+	// Close BoltDB index first
+	if err := bdb.indexDB.Close(); err != nil {
+		log.Printf("[BoltDB] Warning: failed to close index database: %v", err)
+	}
+	// Then close BadgerDB
 	return bdb.db.Close()
 }
 
@@ -1262,6 +1291,8 @@ func (bdb *BadgerTSDB) runBackgroundGC() {
 
 // loadAllSeries scans the database and loads all series labels into memory
 func (bdb *BadgerTSDB) loadAllSeries() error {
+	log.Printf("[BadgerDB] Loading all series metadata from disk...")
+	
 	var skippedCount int
 	var loadedCount int
 
@@ -1273,6 +1304,7 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 		defer it.Close()
 
 		loadedSeries := make(map[uint64]storage.Labels)
+		progressInterval := 10000 // Log every 10k series
 
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
@@ -1299,6 +1331,12 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 				}
 				loadedSeries[seriesID] = labels
 				loadedCount++
+				
+				// Log progress
+				if loadedCount%progressInterval == 0 {
+					log.Printf("[BadgerDB] Progress: loaded %d series...", loadedCount)
+				}
+				
 				return nil
 			})
 			if err != nil {
@@ -1307,8 +1345,11 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 				skippedCount++
 			}
 		}
+		
+		log.Printf("[BadgerDB] Loaded %d series metadata entries", loadedCount)
 
 		// Update labels map and build formatted metrics cache with proper locking
+		log.Printf("[BadgerDB] Building formatted metrics cache for %d series...", len(loadedSeries))
 		bdb.labelsMu.Lock()
 		bdb.labels = loadedSeries
 		// Pre-build formatted metrics cache
@@ -1317,6 +1358,7 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 			bdb.formattedMetrics[seriesID] = formatLabelsAsMetricString(labels)
 		}
 		bdb.labelsMu.Unlock()
+		log.Printf("[BadgerDB] Formatted metrics cache built")
 
 		return nil
 	})
@@ -1328,7 +1370,7 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 	// Try to load persisted index first
 	indexLoadedSuccessfully := false
 	if err := bdb.loadIndexFromDB(); err != nil {
-		log.Printf("[BADGER-INDEX] No persisted index found, building from scratch...")
+		log.Printf("[BOLTDB-INDEX] No persisted index found, building from scratch...")
 	} else {
 		// Simple completeness check: compare number of loaded series vs indexed series
 		// by counting unique __name__ values in the index
@@ -1346,17 +1388,17 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 		}
 		bdb.labelIndexMu.RUnlock()
 		
-		log.Printf("[BADGER-INDEX] Loaded %d series, index has %d unique metric names, %d total posting lists",
+		log.Printf("[BOLTDB-INDEX] Loaded %d series, index has %d unique metric names, %d total posting lists",
 			totalSeries, uniqueMetricNames, totalPostingLists)
 		
 		// If we have many series but very few metric names, index is incomplete
 		// Heuristic: expect at least 100 metric names for 90k+ series (Arcus has 100+)
 		if totalSeries > 10000 && uniqueMetricNames < 50 {
-			log.Printf("[BADGER-INDEX] WARNING: Index appears incomplete (%d series but only %d metric names), rebuilding...", 
+			log.Printf("[BOLTDB-INDEX] WARNING: Index appears incomplete (%d series but only %d metric names), rebuilding...", 
 				totalSeries, uniqueMetricNames)
 			indexLoadedSuccessfully = false
 		} else {
-			log.Printf("[BADGER-INDEX] Successfully loaded persisted index with %d label names", len(bdb.labelIndex))
+			log.Printf("[BOLTDB-INDEX] Successfully loaded persisted index with %d label names", len(bdb.labelIndex))
 			indexLoadedSuccessfully = true
 		}
 	}
@@ -1364,7 +1406,7 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 	// Rebuild index if needed
 	if !indexLoadedSuccessfully {
 		// Build inverted index from loaded series (without persisting each update)
-		log.Printf("[BADGER-INDEX] Building inverted index from %d series...", len(bdb.labels))
+		log.Printf("[BOLTDB-INDEX] Building inverted index from %d series...", len(bdb.labels))
 		
 		// Clear existing index
 		bdb.labelIndexMu.Lock()
@@ -1377,24 +1419,24 @@ func (bdb *BadgerTSDB) loadAllSeries() error {
 			bdb.updateLabelIndexBulk(seriesID, labels)
 			count++
 			if count%progressInterval == 0 {
-				log.Printf("[BADGER-INDEX] Progress: %d/%d series indexed (%.1f%%)",
+				log.Printf("[BOLTDB-INDEX] Progress: %d/%d series indexed (%.1f%%)",
 					count, len(bdb.labels), float64(count)*100.0/float64(len(bdb.labels)))
 			}
 		}
-		log.Printf("[BADGER-INDEX] Index build complete: %d series, %d label names",
+		log.Printf("[BOLTDB-INDEX] Index build complete: %d series, %d label names",
 			len(bdb.labels), len(bdb.labelIndex))
 
 		// Now persist the entire index in one go
-		log.Printf("[BADGER-INDEX] Persisting index to disk...")
+		log.Printf("[BOLTDB-INDEX] Persisting index to disk...")
 		if err := bdb.persistEntireIndex(); err != nil {
-			log.Printf("[BADGER-INDEX] Warning: failed to persist index: %v", err)
+			log.Printf("[BOLTDB-INDEX] Warning: failed to persist index: %v", err)
 		} else {
-			log.Printf("[BADGER-INDEX] Index persisted successfully")
+			log.Printf("[BOLTDB-INDEX] Index persisted successfully")
 		}
 	}
 
 	if skippedCount > 0 {
-		fmt.Printf("Loaded %d series, skipped %d corrupted series\n", loadedCount, skippedCount)
+		log.Printf("Loaded %d series, skipped %d corrupted series", loadedCount, skippedCount)
 	}
 
 	return nil

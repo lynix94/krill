@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -28,6 +29,7 @@ type Config struct {
 		Level          string `yaml:"level"`
 		Format         string `yaml:"format"`
 		LogToStderr    bool   `yaml:"logtostderr"`
+		LogToStdout    bool   `yaml:"log_to_stdout"`
 		LogDir         string `yaml:"log_dir"`
 		LogBacktraceAt string `yaml:"log_backtrace_at"`
 		LogBufLevel    int    `yaml:"logbuflevel"`
@@ -206,13 +208,17 @@ func main() {
 	log.Printf("Loaded config from %s", configPath)
 
 	// Apply logging config
+	var writers []io.Writer
+	
 	if config.Logging.LogToStderr {
+		// Log to stderr
 		flag.Set("logtostderr", "true")
+		writers = append(writers, os.Stderr)
 	} else {
 		flag.Set("logtostderr", "false")
 		
-		// If logging to file, set up log file
-		if config.Logging.LogDir != "" {
+		// Setup file logging if directory is specified
+		if config.Logging.LogDir != "" && config.Logging.LogDir != "stdout" {
 			// Create log directory if not exists
 			if err := os.MkdirAll(config.Logging.LogDir, 0755); err != nil {
 				log.Fatalf("Failed to create log directory: %v", err)
@@ -226,9 +232,7 @@ func main() {
 				log.Fatalf("Failed to open log file: %v", err)
 			}
 			
-			// Redirect log output to file
-			log.SetOutput(logFile)
-			log.Printf("Logging to file: %s", logFileName)
+			writers = append(writers, logFile)
 			
 			// Create symlink to latest log
 			latestLink := filepath.Join(config.Logging.LogDir, "krill-server-latest.log")
@@ -236,7 +240,22 @@ func main() {
 			if err := os.Symlink(filepath.Base(logFileName), latestLink); err != nil {
 				log.Printf("Warning: Failed to create symlink: %v", err)
 			}
+			
+			if config.Logging.LogToStdout {
+				// Also log to stdout
+				writers = append(writers, os.Stdout)
+			}
+		} else {
+			// Log to stdout only
+			writers = append(writers, os.Stdout)
 		}
+	}
+	
+	// Set log output to all configured writers
+	if len(writers) == 1 {
+		log.SetOutput(writers[0])
+	} else if len(writers) > 1 {
+		log.SetOutput(io.MultiWriter(writers...))
 	}
 	
 	if config.Logging.LogDir != "" {
@@ -255,8 +274,21 @@ func main() {
 		flag.Set("log_link", config.Logging.LogLink)
 	}
 	
-	log.Printf("Applied logging config: level=%s, format=%s, logtostderr=%v", 
-		config.Logging.Level, config.Logging.Format, config.Logging.LogToStderr)
+	// Log the effective configuration
+	logDestinations := []string{}
+	if config.Logging.LogToStderr {
+		logDestinations = append(logDestinations, "stderr")
+	} else if config.Logging.LogDir != "" && config.Logging.LogDir != "stdout" {
+		logDestinations = append(logDestinations, "file("+config.Logging.LogDir+")")
+		if config.Logging.LogToStdout {
+			logDestinations = append(logDestinations, "stdout")
+		}
+	} else {
+		logDestinations = append(logDestinations, "stdout")
+	}
+	
+	log.Printf("Applied logging config: level=%s, format=%s, output=%v", 
+		config.Logging.Level, config.Logging.Format, logDestinations)
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Starting Krill TSDB Server...")
@@ -305,6 +337,7 @@ func main() {
 		log.Println("Closing TSDB...")
 		tsdb.Close()
 	}()
+	log.Println("✓ HybridTSDB created successfully")
 	
 	// Log downsampling levels
 	log.Printf("Configured %d sampling levels:", len(config.Sampling))
@@ -321,9 +354,12 @@ func main() {
 	log.Println("Downsampling will use memory cache for fast data reads")
 	dsManager := krill.NewDownsamplingManager(tsdb, memCache)
 	
+	log.Printf("Configuring downsampling levels (skipping level 0 'raw')...")
 	// Add downsampling levels (skip level 0 which is raw)
 	for i := 1; i < len(config.Sampling); i++ {
 		level := config.Sampling[i]
+		log.Printf("Processing downsampling level %d: %s (interval=%s, retention=%s)", 
+			i, level.Name, level.Interval, level.Retention)
 		
 		// Parse interval and retention
 		interval, err := parseFlexibleDuration(level.Interval)
@@ -336,6 +372,8 @@ func main() {
 			log.Fatalf("Invalid retention for level '%s': %v", level.Name, err)
 		}
 		
+		log.Printf("Creating storage for level '%s': path=%s, partitions=%d", 
+			level.Name, level.Storage.Badger.Path, level.Storage.Badger.Partitions)
 		// Create storage for this level
 		dsStorage, err := krill.CreateDownsamplingStorage(
 			level.Storage.Badger.Path,
@@ -347,16 +385,20 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to create storage for level '%s': %v", level.Name, err)
 		}
+		log.Printf("Storage created for level '%s'", level.Name)
 		
 		// Add level to manager
 		if err := dsManager.AddLevel(level.Name, interval, retention, dsStorage); err != nil {
 			log.Fatalf("Failed to add downsampling level '%s': %v", level.Name, err)
 		}
+		log.Printf("Level '%s' added to downsampling manager", level.Name)
 	}
 	
 	// Start downsampling
+	log.Printf("Starting downsampling manager with %d levels configured...", len(config.Sampling)-1)
 	dsManager.Start()
 	defer dsManager.Stop()
+	log.Println("Downsampling manager started successfully")
 
 	// Start embedded scraper if config provided
 	var embeddedScraper *krill.EmbeddedScraper
@@ -366,18 +408,24 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to load scraper config: %v", err)
 		}
+		log.Printf("Scraper config loaded: %d scrape configs", len(config.ScrapeConfigs))
 
+		log.Println("Creating embedded scraper...")
 		embeddedScraper, err = krill.NewEmbeddedScraper(config, tsdb)
 		if err != nil {
 			log.Fatalf("Failed to create embedded scraper: %v", err)
 		}
 
+		log.Println("Starting embedded scraper...")
 		embeddedScraper.Start()
 		defer embeddedScraper.Stop()
 		log.Println("✓ Embedded scraper enabled - Direct TSDB writes (10x+ faster than HTTP)")
+	} else {
+		log.Println("No scraper config provided, skipping embedded scraper")
 	}
 
 	// Create and start web server
+	log.Println("Creating web server...")
 	// Create web server
 	server := web.NewServer(web.ServerOptions{
 		Addr:       *addr,

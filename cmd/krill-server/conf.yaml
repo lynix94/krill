@@ -58,11 +58,20 @@ logging:
   # Log format: json, text
   format: text
   
-  # Log to standard error instead of files
+  # Log to standard error (stderr)
+  # If true, all logs go to stderr only (overrides other settings)
   logtostderr: false
   
-  # Log file directory (empty = disabled, only used if logtostderr=false)
-  log_dir: "./logs"
+  # Log file directory 
+  # - Use "stdout" to log to standard output only
+  # - Use "./logs" to log to file only (unless log_to_stdout=true)
+  # - Empty = log to stdout (when logtostderr=false)
+  log_dir: "stdout"
+  
+  # Also log to stdout when logging to file
+  # This allows you to see logs in console AND save to file simultaneously
+  # Only effective when log_dir is set to an actual directory path (not "stdout")
+  log_to_stdout: true
   
   # Enable stack trace at specific file:line (e.g., "server.go:123")
   log_backtrace_at: ""
@@ -72,3 +81,24 @@ logging:
   
   # Create symbolic links to log files in this directory
   log_link: ""
+
+# Logging Configuration Examples:
+# 
+# 1. Log to stdout only (current configuration):
+#    logtostderr: false
+#    log_dir: "stdout"
+#    log_to_stdout: false
+#
+# 2. Log to file only:
+#    logtostderr: false
+#    log_dir: "./logs"
+#    log_to_stdout: false
+#
+# 3. Log to BOTH file AND stdout (see in console + save to file):
+#    logtostderr: false
+#    log_dir: "./logs"
+#    log_to_stdout: true
+#
+# 4. Log to stderr only:
+#    logtostderr: true
+#    (log_dir and log_to_stdout are ignored)
