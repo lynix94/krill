@@ -43,8 +43,9 @@ type ParsedQuery struct {
 	AggParamLabel string  // For count_values
 	MetricName    string
 	LabelMatchers map[string]string
-	GroupBy       []string // Labels to group by
-	RangeVector   int64    // Range in seconds (for _over_time functions)
+	GroupBy       []string     // Labels to group by
+	RangeVector   int64        // Range in seconds (for _over_time functions)
+	InnerQuery    *ParsedQuery // For nested functions like sum(rate(...))
 }
 
 // parsePromQL parses a PromQL query with optional aggregation function
@@ -122,19 +123,41 @@ func parsePromQL(query string) ParsedQuery {
 					}
 				}
 
-				// Parse range vector selector [5m], [1h], etc.
-				if strings.Contains(innerQuery, "[") {
-					rangeStart := strings.Index(innerQuery, "[")
-					rangeEnd := strings.Index(innerQuery, "]")
-					if rangeStart > 0 && rangeEnd > rangeStart {
-						rangeStr := innerQuery[rangeStart+1 : rangeEnd]
-						parsed.RangeVector = parseDuration(rangeStr)
-						innerQuery = innerQuery[:rangeStart] // Remove range selector from query
+				// Check if innerQuery is another function (e.g., sum(rate(...)))
+				// Range vector functions: rate, irate, *_over_time
+				rangeVectorFuncs := []string{"rate(", "irate(", "sum_over_time(", "avg_over_time(", 
+					"min_over_time(", "max_over_time(", "count_over_time(", 
+					"stddev_over_time(", "stdvar_over_time(", "quantile_over_time("}
+				isNestedFunction := false
+				for _, rvFunc := range rangeVectorFuncs {
+					if strings.HasPrefix(innerQuery, rvFunc) {
+						// Recursively parse the inner query
+						innerParsed := parsePromQL(innerQuery)
+						parsed.InnerQuery = &innerParsed
+						// Copy metric and label info from inner query
+						parsed.MetricName = innerParsed.MetricName
+						parsed.LabelMatchers = innerParsed.LabelMatchers
+						parsed.RangeVector = innerParsed.RangeVector
+						isNestedFunction = true
+						break
 					}
 				}
 
-				// Parse the inner metric query
-				parsed.MetricName, parsed.LabelMatchers = parseMetricKey(innerQuery)
+				if !isNestedFunction {
+					// Parse range vector selector [5m], [1h], etc.
+					if strings.Contains(innerQuery, "[") {
+						rangeStart := strings.Index(innerQuery, "[")
+						rangeEnd := strings.Index(innerQuery, "]")
+						if rangeStart > 0 && rangeEnd > rangeStart {
+							rangeStr := innerQuery[rangeStart+1 : rangeEnd]
+							parsed.RangeVector = parseDuration(rangeStr)
+							innerQuery = innerQuery[:rangeStart] // Remove range selector from query
+						}
+					}
+
+					// Parse the inner metric query
+					parsed.MetricName, parsed.LabelMatchers = parseMetricKey(innerQuery)
+				}
 
 				// Check for "by" clause after the closing parenthesis
 				remaining := strings.TrimSpace(query[endIdx+1:])

@@ -518,8 +518,42 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 	parseStart := time.Now()
 	parsed := parsePromQL(query)
 	addTiming(profile, "parse_promql_ms", parseStart)
-	log.Printf("[PARSE] Query: %s => MetricName: %q, LabelMatchers: %v, AggFunc: %v",
-		query, parsed.MetricName, parsed.LabelMatchers, parsed.AggFunc)
+	log.Printf("[PARSE] Query: %s => MetricName: %q, LabelMatchers: %v, AggFunc: %v, HasInnerQuery: %v",
+		query, parsed.MetricName, parsed.LabelMatchers, parsed.AggFunc, parsed.InnerQuery != nil)
+
+	// Handle nested queries like sum(rate(...))
+	if parsed.InnerQuery != nil && step > 0 {
+		innerParsed := *parsed.InnerQuery
+		
+		// Check if inner query is a range vector function
+		isInnerRangeVectorFunc := innerParsed.AggFunc == AggRate || innerParsed.AggFunc == AggIrate ||
+			innerParsed.AggFunc == AggSumOverTime || innerParsed.AggFunc == AggAvgOverTime ||
+			innerParsed.AggFunc == AggMinOverTime || innerParsed.AggFunc == AggMaxOverTime ||
+			innerParsed.AggFunc == AggCountOverTime || innerParsed.AggFunc == AggStddevOverTime ||
+			innerParsed.AggFunc == AggStdvarOverTime || innerParsed.AggFunc == AggQuantileOverTime
+
+		if isInnerRangeVectorFunc {
+			// Evaluate inner range vector function first
+			stepEvalStart := time.Now()
+			innerResult := ph.evaluateRangeVectorWithStep(innerParsed, start, end, step, profile)
+			addTiming(profile, "range_vector_step_eval_ms", stepEvalStart)
+			
+			// Apply outer aggregation to the result
+			aggStart := time.Now()
+			finalResult := applyAggregation(parsed, innerResult)
+			addTiming(profile, "aggregation_ms", aggStart)
+			
+			if profile != nil {
+				profile.TimingsMS["total_ms"] = float64(time.Since(startTime).Nanoseconds()) / 1e6
+			}
+			ph.sendSuccess(w, QueryData{
+				ResultType: "matrix",
+				Result:     finalResult,
+				Profile:    profile,
+			})
+			return
+		}
+	}
 
 	// Check if this is a range vector function with step parameter
 	isRangeVectorFunc := parsed.AggFunc == AggRate || parsed.AggFunc == AggIrate ||
@@ -537,7 +571,7 @@ func (ph *PrometheusHandler) HandleQueryRange(w http.ResponseWriter, r *http.Req
 			return
 		}
 		stepEvalStart := time.Now()
-		result := ph.evaluateRangeVectorWithStep(parsed, start, end, step)
+		result := ph.evaluateRangeVectorWithStep(parsed, start, end, step, profile)
 		addTiming(profile, "range_vector_step_eval_ms", stepEvalStart)
 		if profile != nil {
 			profile.TimingsMS["total_ms"] = float64(time.Since(startTime).Nanoseconds()) / 1e6
@@ -1146,7 +1180,7 @@ func downsampleByStep(timestamps []int64, values []float64, start, end, step int
 }
 
 // evaluateRangeVectorWithStep evaluates range vector functions (rate/irate/*_over_time) at multiple time steps
-func (ph *PrometheusHandler) evaluateRangeVectorWithStep(parsed ParsedQuery, start, end, step int64) []QueryResult {
+func (ph *PrometheusHandler) evaluateRangeVectorWithStep(parsed ParsedQuery, start, end, step int64, profile *QueryProfile) []QueryResult {
 	var results []QueryResult
 
 	// Validate that range vector is specified for range vector functions
@@ -1156,17 +1190,73 @@ func (ph *PrometheusHandler) evaluateRangeVectorWithStep(parsed ParsedQuery, sta
 		return results
 	}
 
-	// Get all matching metrics
-	metrics, err := ph.tsdb.GetMetrics()
-	if err != nil {
-		return results
+	// Use inverted index to find matching series (much faster than GetMetrics)
+	type IndexFinder interface {
+		FindSeriesByLabels(map[string]string) []uint64
+	}
+	type LabelsGetter interface {
+		GetLabelsForSeriesID(uint64) (storage.Labels, bool)
+	}
+	type FormattedMetricsGetter interface {
+		GetFormattedMetric(uint64) (string, bool)
 	}
 
-	// Filter metrics by name and labels
-	for _, metric := range metrics {
-		if !matchesQuery(metric, parsed.MetricName, parsed.LabelMatchers) {
-			continue
+	var matchingMetrics []string
+
+	if finder, ok := ph.tsdb.(IndexFinder); ok && parsed.MetricName != "" {
+		// Use inverted index for fast series lookup
+		allMatchers := make(map[string]string)
+		allMatchers["__name__"] = parsed.MetricName
+		for k, v := range parsed.LabelMatchers {
+			allMatchers[k] = v
 		}
+
+		if ph.debugIndex {
+			log.Printf("[INDEX-RATE] Using index search with matchers: %v", allMatchers)
+		}
+		seriesIDs := finder.FindSeriesByLabels(allMatchers)
+		if ph.debugIndex {
+			log.Printf("[INDEX-RATE] Found %d matching series IDs", len(seriesIDs))
+		}
+
+		// Record index usage in profile
+		if profile != nil {
+			profile.Index.Used = true
+			profile.Index.MatcherCount = len(allMatchers)
+			profile.Index.SeriesIDsCount = len(seriesIDs)
+			profile.Index.Matchers = allMatchers
+		}
+
+		// Convert seriesIDs to metric names
+		if fmtGetter, ok := ph.tsdb.(FormattedMetricsGetter); ok {
+			for _, seriesID := range seriesIDs {
+				if metricStr, found := fmtGetter.GetFormattedMetric(seriesID); found {
+					matchingMetrics = append(matchingMetrics, metricStr)
+				}
+			}
+		} else if labelsGetter, ok := ph.tsdb.(LabelsGetter); ok {
+			for _, seriesID := range seriesIDs {
+				if labels, found := labelsGetter.GetLabelsForSeriesID(seriesID); found {
+					matchingMetrics = append(matchingMetrics, formatLabelsAsMetricString(labels))
+				}
+			}
+		}
+	} else {
+		// Fallback: get all metrics and filter
+		metrics, err := ph.tsdb.GetMetrics()
+		if err != nil {
+			return results
+		}
+		for _, metric := range metrics {
+			if !matchesQuery(metric, parsed.MetricName, parsed.LabelMatchers) {
+				continue
+			}
+			matchingMetrics = append(matchingMetrics, metric)
+		}
+	}
+
+	// Process each matching metric
+	for _, metric := range matchingMetrics {
 
 		// Parse metric labels
 		parsedName, parsedTags := parseMetricKey(metric)
@@ -1182,15 +1272,32 @@ func (ph *PrometheusHandler) evaluateRangeVectorWithStep(parsed ParsedQuery, sta
 			evaluationTimes = append(evaluationTimes, end)
 		}
 
+		// OPTIMIZATION: Fetch data for entire range ONCE (instead of per evaluation time)
+		// This reduces 80 series × 20 eval times = 1600 Get() calls to just 80 Get() calls
+		dataStart := start - parsed.RangeVector
+		dataEnd := end
+		allTimestamps, allValues, err := ph.tsdb.Get(metric, dataStart, dataEnd)
+		if err != nil || len(allValues) == 0 {
+			continue
+		}
+
 		var valuesArray [][]interface{}
 
 		for _, evalTime := range evaluationTimes {
-			// Get data in the range vector window before this evaluation time
+			// Filter data points within the range vector window for this evaluation time
 			rangeStart := evalTime - parsed.RangeVector
 			rangeEnd := evalTime
 
-			timestamps, values, err := ph.tsdb.Get(metric, rangeStart, rangeEnd)
-			if err != nil || len(values) == 0 {
+			var timestamps []int64
+			var values []float64
+			for i := 0; i < len(allTimestamps); i++ {
+				if allTimestamps[i] >= rangeStart && allTimestamps[i] <= rangeEnd {
+					timestamps = append(timestamps, allTimestamps[i])
+					values = append(values, allValues[i])
+				}
+			}
+
+			if len(values) == 0 {
 				continue
 			}
 
@@ -1380,7 +1487,7 @@ func (ph *PrometheusHandler) HandleKrillQL(w http.ResponseWriter, r *http.Reques
 					parsed.AggFunc, parsed.AggFunc))
 			return
 		}
-		result := ph.evaluateRangeVectorWithStep(parsed, firstStage.Start, firstStage.End, firstStage.Step)
+		result := ph.evaluateRangeVectorWithStep(parsed, firstStage.Start, firstStage.End, firstStage.Step, nil)
 		currentResult = QueryData{
 			ResultType: "matrix",
 			Result:     result,
