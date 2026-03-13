@@ -1274,7 +1274,15 @@ func (ph *PrometheusHandler) evaluateRangeVectorWithStep(parsed ParsedQuery, sta
 
 		// OPTIMIZATION: Fetch data for entire range ONCE (instead of per evaluation time)
 		// This reduces 80 series × 20 eval times = 1600 Get() calls to just 80 Get() calls
+		//
+		// For rate/irate we need one extra sample before the window start so that a
+		// data point sitting exactly on the boundary (or just outside by a few seconds
+		// due to scrape-timing jitter) can still be used. Fetch from
+		// start - 2*RangeVector so we always have a "previous point" available.
 		dataStart := start - parsed.RangeVector
+		if parsed.AggFunc == AggRate || parsed.AggFunc == AggIrate {
+			dataStart = start - 2*parsed.RangeVector
+		}
 		dataEnd := end
 		allTimestamps, allValues, err := ph.tsdb.Get(metric, dataStart, dataEnd)
 		if err != nil || len(allValues) == 0 {
@@ -1294,6 +1302,20 @@ func (ph *PrometheusHandler) evaluateRangeVectorWithStep(parsed ParsedQuery, sta
 				if allTimestamps[i] >= rangeStart && allTimestamps[i] <= rangeEnd {
 					timestamps = append(timestamps, allTimestamps[i])
 					values = append(values, allValues[i])
+				}
+			}
+
+			// rate/irate staleness lookback: if fewer than 2 points fall inside the
+			// strict window, look for the nearest data point just before rangeStart.
+			// This handles the common edge case where a scrape timestamp lands exactly
+			// on the window boundary and is shifted out by a second on the next call.
+			if (parsed.AggFunc == AggRate || parsed.AggFunc == AggIrate) && len(values) < 2 {
+				for i := len(allTimestamps) - 1; i >= 0; i-- {
+					if allTimestamps[i] < rangeStart {
+						timestamps = append([]int64{allTimestamps[i]}, timestamps...)
+						values = append([]float64{allValues[i]}, values...)
+						break
+					}
 				}
 			}
 

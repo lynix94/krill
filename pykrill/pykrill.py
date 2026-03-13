@@ -252,11 +252,15 @@ class PyKrillDaemon:
                     print("[WARNING] Client request timeout", file=sys.stderr)
                     break
             
+            # Remove timeout before executing the function so a long-running
+            # function doesn't cause a socket timeout when we send the response.
+            conn.settimeout(None)
+
             if data:
                 try:
                     request = json.loads(data.decode('utf-8'))
                     response = self.execute_function(request)
-                    
+
                     # Send response
                     conn.sendall(json.dumps(response).encode('utf-8'))
                 except json.JSONDecodeError as e:

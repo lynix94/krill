@@ -210,6 +210,13 @@ func sendToDaemon(request map[string]string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("failed to connect to daemon: %v", err)
 	}
 	defer conn.Close()
+
+	// Set an overall deadline so we never block indefinitely.
+	// The Python daemon has its own function timeout (DEFAULT_TIMEOUT=300s),
+	// so we give a bit of headroom: 310 seconds.
+	if err := conn.SetDeadline(time.Now().Add(310 * time.Second)); err != nil {
+		return nil, fmt.Errorf("failed to set deadline: %v", err)
+	}
 	
 	// Send request as JSON
 	requestData, err := json.Marshal(request)
